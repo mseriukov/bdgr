@@ -408,9 +408,13 @@ static void image_test(const char* fn, bool rle, int near) {
     char filename[128];
     const char* p = strrchr(fn, '.');
     int len = (int)(p - fn) - 1;
-    sprintf(filename, "%.*s.%snear=%d.png", len, fn, rle ? "rle." : "", near);
+    if (near != 0) {
+        sprintf(filename, "%.*s.%snear=%d.png", len, fn, rle ? "rle-" : "", near);
+    } else {
+        sprintf(filename, "%.*s.%sloco.png", len, fn, rle ? "rle-" : "");
+    }
     stbi_write_png(filename, w, h, 1, decoded, 0);
-    printf("%s error(rms) = %.1f%c\n", filename, rms(decoded, copy, n) * 100, '%');
+    if (near != 0) { printf("%s error(rms) = %.1f%c\n", filename, rms(decoded, copy, n) * 100, '%'); }
     free(copy);
     free(encoded);
     free(decoded);
@@ -427,6 +431,6 @@ int main(int argc, const char* argv[]) {
     image_test("greyscale.128x128.pgm", true, 0);
     image_test("greyscale.640x480.pgm", false, 0);
     image_test("greyscale.640x480.pgm", true, 0);
-    image_test("greyscale.640x480.pgm", true, 6);
+    image_test("greyscale.640x480.pgm", true, 4);
     return 0;
 }
