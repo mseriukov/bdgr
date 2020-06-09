@@ -237,16 +237,17 @@ static int encode_context(encoder_context_t* context) {
             ctx.d2  = ctx.b - ctx.c;
             ctx.d3  = ctx.c - ctx.a;
             int predicted = prediction(ctx.x, ctx.y, ctx.a, ctx.b, ctx.c);
-            int delta = predicted - ctx.v;
-            // delta:    -255 ... -2, -1, 0, +1, +2 ... + 255
-            // positive:                  0,  2,  4       510
-            // negative:  509      3   1
-            int rice = delta >= 0 ? delta * 2 : -2 * delta - 1;
-            if (ctx.rle) {
-                assert(0 <= rice && rice <= rle_marker);
-            } else {
-                assert(0 <= rice && rice < 511);
-            }
+            int delta = (byte)predicted - (byte)ctx.v;
+            assert((byte)(predicted - delta) == (byte)ctx.v);
+            delta = delta < 0 ? delta + 256 : delta;
+            delta = delta >= 128 ? delta - 256 : delta;
+            // this folds abs(deltas) > 128 to much smaller numbers which is OK
+            assert(-128 <= delta && delta <= 127);
+            // delta:    -128 ... -2, -1, 0, +1, +2 ... + 127
+            // positive:                  0,  2,  4       254
+            // negative:  255      3   1
+            int rice = delta >= 0 ? delta * 2 : -delta * 2 - 1;
+            assert(0 <= rice && rice < rle_marker);
             ctx.pos = encode_entropy(ctx.output, ctx.max_bytes, ctx.pos, rice, ctx.bits);
 //          printf("[%3d,%-3d] predicted=%3d v=%3d rice=%4d delta=%4d bits=%d run=%d pushed_out_bits=%d\n",
 //                 ctx.x, ctx.y, predicted, ctx.v, rice, delta, ctx.bits, ctx.run.count, ctx.pos - ctx.pbp);
@@ -338,7 +339,7 @@ int decode(byte* input, int bytes, bool rle, byte* output, int w, int h) {
                     while ((1 << bits) < rice) { bits++; }
                     assert(0 <= rice && rice < 511);
                     int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
-                    int v = predicted - delta;
+                    int v = (byte)(predicted - delta);
                     assert(0 <= v && v <= 0xFF);
                     line[x] = (byte)v;
                     last = v;
@@ -407,7 +408,7 @@ static void image_test(const char* fn, bool rle, int near) {
     }
     char filename[128];
     const char* p = strrchr(fn, '.');
-    int len = (int)(p - fn) - 1;
+    int len = (int)(p - fn);
     if (near != 0) {
         sprintf(filename, "%.*s.%snear=%d.png", len, fn, rle ? "rle-" : "", near);
     } else {
@@ -421,9 +422,37 @@ static void image_test(const char* fn, bool rle, int near) {
     stbi_image_free(data);
 }
 
+static void delta_modulo_folding(int step, bool verbose) {
+    for (int p = 0; p <= 0xFF; p += step) {
+        for (int v = 0; v <= 0xFF; v += step) {
+            int d1 = p - v;
+            assert(-255 <= d1 && d1 <= +255);
+            // because: for any byte x (x + delta) == (x + delta + 256)
+            assert((byte)v == (byte)(p - d1));
+            int d2 = d1 < 0 ? d1 + 256 : d1;
+            int d3 = d2 >= 128 ? d2 - 256 : d2;
+            // this folds abs(deltas) > 128 to much smaller numbers which is OK
+            assert(-128 <= d3 && d3 <= 127);
+            int rice = d3 >= 0 ? d3 * 2 : -d3 * 2 - 1;
+            int log2 = 0;
+            while ((1 << log2) < rice) { log2++; }
+            int ice = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
+            assert(ice == d3);
+            int x = (byte)(p - ice);
+            if (verbose) {
+                printf("p=%4d v=%4d d1=%4d d2=%4d d3=%4d rice=%4d log2=%d x=%4d\n",
+                        p, v, d1, d2, d3, rice, log2, x);
+            }
+            assert(x == v);
+        }
+    }
+}
+
 int main(int argc, const char* argv[]) {
     (void)argv; (void)argc;
     setbuf(stdout, null);
+    delta_modulo_folding(1, false);
+    delta_modulo_folding(63, true);
     d8x4_test(true, 0);  // with RLE
     d8x4_test(false, 0); // w/o RLE
     d8x4_test(true, 4);  // with RLE
@@ -432,5 +461,6 @@ int main(int argc, const char* argv[]) {
     image_test("greyscale.640x480.pgm", false, 0);
     image_test("greyscale.640x480.pgm", true, 0);
     image_test("greyscale.640x480.pgm", true, 4);
+    image_test("greyscale.640x480.pgm", true, 6);
     return 0;
 }
