@@ -15,8 +15,8 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <sys/stat.h>
+#include <folders.h>
+
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -32,6 +32,10 @@
 #define countof(a) (sizeof(a) / sizeof((a)[0]))
 #define minimum(a, b) ((a) < (b) ? (a) : (b))
 #define maximum(a, b) ((a) > (b) ? (a) : (b))
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 static void hexdump(byte* data, int bytes) {
     for (int i = 0; i < bytes; i++) { printf("%02X", data[i]); }
@@ -136,11 +140,21 @@ typedef struct run_context_s { // RLE
     int bits;  // bit-width of Golomb entropy encoding at the beginning of a `run'
 } run_context_t;
 
+typedef struct neighbors_s { // RLE
+    int a; //  c b d
+    int c; //  a v
+    int b;
+    int d;
+    int d1; // d - b
+    int d2; // b - c
+    int d3; // c - a
+} neighbors_t;
+
 typedef struct encoder_context_s {
     int w;
     int h;
     bool rle;
-    int  near;
+    int  lossy;
     byte* data;
     byte* output;
     int   max_bytes; // number of bytes available in output
@@ -153,14 +167,7 @@ typedef struct encoder_context_s {
     int x;
     int y;
     int v; // current pixel value at [x,y]
-    // neighboring values (updated for lossy)
-    int a; //  c b d
-    int c; //  a v
-    int b;
-    int d;
-    int d1; // d - b
-    int d2; // b - c
-    int d3; // c - a
+    neighbors_t neighbors;
 //  only for stats and debugging:
     int rle_saved_bits;
     int pbp;  // bit position after encoding previous symbol
@@ -212,36 +219,57 @@ static int prediction(int x, int y, int a, int b, int c) {
     }
 }
 
+static void neighbors(int x, int y, int w, byte* prev, byte* line, neighbors_t* nei) {
+    #define ns (*nei)
+    //  c b d
+    //  a v
+    ns.a = x == 0 ? 0 : line[x - 1];
+    ns.c = y == 0 || x == 0 ? ns.a : prev[x - 1];
+    ns.b = y == 0 ? ns.a : prev[x];
+    ns.d = y == 0 || x == w - 1 ? ns.b : prev[x + 1];
+    // gradients:
+    ns.d1  = ns.d - ns.b;
+    ns.d2  = ns.b - ns.c;
+    ns.d3  = ns.c - ns.a;
+}
+
 static int encode_context(encoder_context_t* context) {
     for (ctx.y = 0; ctx.y < ctx.h; ctx.y++) {
         for (ctx.x = 0; ctx.x < ctx.w; ctx.x++) {
             ctx.v = (int)ctx.line[ctx.x];
             if (ctx.rle) {
-                if (ctx.run.count == 0 && abs(ctx.last - ctx.v) <= ctx.near) {
+                if (ctx.run.count == 0 && abs(ctx.last - ctx.v) <= ctx.lossy) {
                     ctx.run.count = 1;
                     ctx.run.val   = ctx.last;
                     ctx.run.pos   = ctx.pos;
                     ctx.run.bits  = ctx.bits;
                     ctx.run.x     = ctx.x;
-                } else if (abs(ctx.run.val - ctx.v) <= ctx.near && ctx.run.count < 0xFF) {
+                } else if (abs(ctx.run.val - ctx.v) <= ctx.lossy && ctx.run.count < 0xFF) {
                     ctx.run.count++;
                 } else if (ctx.run.count != 0) {
                     encode_run(context);
                 }
             }
-            ctx.a = ctx.x == 0 ? 0 : ctx.line[ctx.x - 1];
-            ctx.c = ctx.y == 0 || ctx.x == 0 ? 0 : ctx.prev[ctx.x - 1];
-            ctx.b = ctx.y == 0 ? 0 : ctx.prev[ctx.x];
-            ctx.d = ctx.y == 0 || ctx.x == ctx.w - 1 ? 0 : ctx.prev[ctx.x + 1];
-            ctx.d1  = ctx.d - ctx.b;
-            ctx.d2  = ctx.b - ctx.c;
-            ctx.d3  = ctx.c - ctx.a;
-            int predicted = prediction(ctx.x, ctx.y, ctx.a, ctx.b, ctx.c);
-            int delta = (byte)predicted - (byte)ctx.v;
-            assert((byte)(predicted - delta) == (byte)ctx.v);
-            if (ctx.near > 0) {
-                delta = (128 - ctx.near) * delta / 128;
-                ctx.v = (byte)(predicted - delta);
+            neighbors(ctx.x, ctx.y, ctx.w, ctx.prev, ctx.line, &ctx.neighbors);
+            int predicted = prediction(ctx.x, ctx.y, ctx.neighbors.a, ctx.neighbors.b, ctx.neighbors.c);
+            int delta = (byte)ctx.v - (byte)predicted;
+            assert((byte)(predicted + delta) == (byte)ctx.v);
+            if (ctx.lossy > 0) {
+                #ifdef ANDREYS_LOSSY_ADJUSTMENT // does not work
+                    // lossy adjustment
+                    if (delta > 0) {
+                        delta = (ctx.lossy + delta) / (2 * ctx.lossy + 1);
+                    } else {
+                        delta = - (ctx.lossy - delta) / (2 * ctx.lossy + 1);
+                    }
+                    int r = predicted + ctx.v * (2 * ctx.lossy + 1);
+                    if (r < 0) { r = 0; }
+                    if (r > 255) { r = 255; }
+                    ctx.v = (byte)r;
+                    ctx.line[ctx.x] = (byte)ctx.v;  // need to write back resulting value
+                #endif
+                delta = (128 - ctx.lossy) * delta / 128;
+                ctx.v = (byte)(predicted + delta);
                 ctx.line[ctx.x] = (byte)ctx.v;  // need to write back resulting value
             }
             delta = delta < 0 ? delta + 256 : delta;
@@ -269,22 +297,24 @@ static int encode_context(encoder_context_t* context) {
     }
     const int bytes = (ctx.pos + 7) / 8;
     const int wh = ctx.w * ctx.h;
+    const double bpp = ctx.pos / (double)wh;
+    const double percent = 100.0 * bytes / wh;
     if (ctx.rle) {
-        printf("%dx%d (%d) %d->%d bytes %.3f bps (RLE saved %d bytes)\n",
-                ctx.w, ctx.h, ctx.near, wh, bytes, ctx.pos / (wh * 8.0), ctx.rle_saved_bits / 8);
+        printf("%dx%d (%d) %d->%d bytes %.3f bpp %.1f%c RLE saved %d bytes (lossy=%d)\n",
+                ctx.w, ctx.h, ctx.lossy, wh, bytes, bpp, percent, '%',
+                ctx.rle_saved_bits / 8, ctx.lossy);
     } else {
-        printf("%dx%d (%d) %d->%d bytes %.3f bps no RLE\n",
-                ctx.w, ctx.h, ctx.near, wh, bytes, ctx.pos / (wh * 8.0));
+        printf("%dx%d (%d) %d->%d bytes %.3f bpp %.1f%c no RLE (lossy=%d)\n",
+                ctx.w, ctx.h, ctx.lossy, wh, bytes, bpp, percent, '%', ctx.lossy);
     }
     return bytes;
 }
 
-int encode(byte* data, int w, int h, bool rle, int near, byte* output, int max_bytes) {
-    assert(near >= 0);
-    if (!rle) { assert(near == 0); } // near is only used with RLE runs...
+int encode(byte* data, int w, int h, bool rle, int lossy, byte* output, int max_bytes) {
+    assert(lossy >= 0);
     encoder_context_t context = {};
     context.rle = rle;
-    context.near = near;
+    context.lossy = lossy;
     context.data = data;
     context.w = w;
     context.h = h;
@@ -317,14 +347,9 @@ int decode(byte* input, int bytes, bool rle, byte* output, int w, int h) {
                     bits = start_with_bits; // expected edge after run
                 }
             } else {
-                const int a = x == 0 ? 0 : line[x - 1];
-                const int c = x == 0 || y == 0 ? 0 : prev[x - 1];
-                const int b = y == 0 ? 0 : prev[x];
-//              const int d = y == 0 || x == w - 1 ? 0 : prev[x + 1];
-//              const int d1  = d - b;
-//              const int d2  = b - c;
-//              const int d3  = c - a;
-                int predicted = prediction(x, y, a, b, c);
+                neighbors_t nei;
+                neighbors(x, y, w, prev, line, &nei);
+                int predicted = prediction(x, y, nei.a, nei.b, nei.c);
                 int rice = decode_entropy(input, bytes, &pos, bits);
                 if (!rle) {
                     assert(0 <= rice && rice < rle_marker);
@@ -344,7 +369,7 @@ int decode(byte* input, int bytes, bool rle, byte* output, int w, int h) {
                     while ((1 << bits) < rice) { bits++; }
                     assert(0 <= rice && rice < 511);
                     int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
-                    int v = (byte)(predicted - delta);
+                    int v = (byte)(predicted + delta);
                     assert(0 <= v && v <= 0xFF);
                     line[x] = (byte)v;
                     last = v;
@@ -360,7 +385,7 @@ int decode(byte* input, int bytes, bool rle, byte* output, int w, int h) {
     return w * h;
 }
 
-static void d8x4_test(bool rle, int near) {
+static void d8x4_test(bool rle, int lossy) {
     enum { w = 8, h = 4, bytes = w * h };
 /*
     byte data[w * h] = {
@@ -379,11 +404,11 @@ static void d8x4_test(bool rle, int near) {
     byte copy[bytes];
     memcpy(copy, data, bytes);
     byte encoded[countof(data) * 2] = {};
-    int k = encode(data, w, h, rle, near, encoded, countof(encoded));
+    int k = encode(data, w, h, rle, lossy, encoded, countof(encoded));
     byte decoded[countof(data)] = {};
     int n = decode(encoded, k, rle, decoded, w, h);
     assert(n == countof(data));
-    if (near == 0) {
+    if (lossy == 0) {
         assert(memcmp(decoded, data, n) == 0);
     } else {
         // TODO: calculate and print abs(error)
@@ -391,7 +416,10 @@ static void d8x4_test(bool rle, int near) {
     printf("error(rms) = %.1f%c\n", rms(decoded, copy, n) * 100, '%');
 }
 
-static void image_test(const char* fn, bool rle, int near) {
+static bool option_output;
+static int  option_lossy;
+
+static void image_compress(const char* fn, bool rle, int lossy, bool write) {
     int w = 0;
     int h = 0;
     int c = 0;
@@ -402,24 +430,24 @@ static void image_test(const char* fn, bool rle, int near) {
     byte* decoded = (byte*)malloc(bytes);
     byte* copy    = (byte*)malloc(bytes);
     memcpy(copy, data, bytes);
-    int k = encode(data, w, h, rle, near, encoded, bytes * 3);
+    int k = encode(data, w, h, rle, lossy, encoded, bytes * 3);
     int n = decode(encoded, k, rle, decoded, w, h);
     assert(n == bytes);
-    // even if data has been modified by near > 0:
-    assert(memcmp(data, decoded, n) == 0);
-    if (near == 0) {
+    if (lossy == 0) {
         assert(memcmp(decoded, copy, n) == 0);
     }
-    char filename[128];
-    const char* p = strrchr(fn, '.');
-    int len = (int)(p - fn);
-    if (near != 0) {
-        sprintf(filename, "%.*s.near=%d.png", len, fn, near);
-    } else {
-        sprintf(filename, "%.*s.loco%s.png", len, fn, rle ? "-rle" : "");
+    if (write) {
+        char filename[128];
+        const char* p = strrchr(fn, '.');
+        int len = (int)(p - fn);
+        if (lossy != 0) {
+            sprintf(filename, "%.*s.lossy=%d%s.png", len, fn, lossy, rle ? "-rle" : "");
+        } else {
+            sprintf(filename, "%.*s.loco%s.png", len, fn, rle ? "-rle" : "");
+        }
+        stbi_write_png(filename, w, h, 1, decoded, 0);
+        if (lossy != 0) { printf("%s error(rms) = %.1f%c\n", filename, rms(decoded, copy, n) * 100, '%'); }
     }
-    stbi_write_png(filename, w, h, 1, decoded, 0);
-    if (near != 0) { printf("%s error(rms) = %.1f%c\n", filename, rms(decoded, copy, n) * 100, '%'); }
     free(copy);
     free(encoded);
     free(decoded);
@@ -452,19 +480,84 @@ static void delta_modulo_folding(int step, bool verbose) {
     }
 }
 
+static void straighten(char* pathname) {
+    while (strchr(pathname, '\\') != null) { *strchr(pathname, '\\') = '/'; }
+}
+
+static void compress_folder(const char* folder_name) {
+    folder_t folders = folder_open();
+    int r = folder_enumerate(folders, folder_name);
+    if (r != 0) { perror("failed to open folder"); exit(1); }
+    const char* folder = folder_foldername(folders);
+    const int n = folder_count(folders);
+    for (int i = 0; i < n; i++) {
+        const char* name = folder_filename(folders, i);
+        int pathname_length = (int)(strlen(folder) + strlen(name) + 3);
+        char* pathname = (char*)malloc(pathname_length);
+        if (pathname == null) { break; }
+        snprintf(pathname, pathname_length, "%s/%s", folder, name);
+        straighten(pathname);
+        const char* suffix = "";
+        if (folder_is_folder(folders, i)) { suffix = "/"; }
+        if (folder_is_symlink(folders, i)) { suffix = "->"; }
+        printf("%s%s\n", pathname, suffix);
+        image_compress(pathname, false, 0, false);
+        image_compress(pathname, true,  0, false);
+        image_compress(pathname, false, 4, false);
+        image_compress(pathname, true,  4, false);
+        free(pathname);
+    }
+    folder_close(folders);
+}
+
+static int option_int(int argc, const char* argv[], const char* opt, int *n) {
+    for (int i = 0; i < argc; i++) {
+        int t = 0;
+        if (sscanf(argv[i], opt, &t) == 1) {
+            *n = t;
+            for (int j = i + 1; j < argc; j++) { argv[i] = argv[j]; }
+            argc--;
+            break;
+        }
+    }
+    return argc;
+}
+
+static int option_bool(int argc, const char* argv[], const char* opt, bool *b) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], opt) == 0) {
+            *b = true;
+            for (int j = i + 1; j < argc; j++) { argv[i] = argv[j]; }
+            argc--;
+            break;
+        }
+    }
+    return argc;
+}
+
 int main(int argc, const char* argv[]) {
-    (void)argv; (void)argc;
     setbuf(stdout, null);
+    argc = option_bool(argc, argv, "-o", &option_output);
+    argc = option_int(argc, argv, "-n=%d", &option_lossy);
+    if (argc > 1 && is_folder(argv[1])) {
+        compress_folder(argv[1]);
+    }
     delta_modulo_folding(1, false);
-    delta_modulo_folding(63, true);
+//  delta_modulo_folding(63, true);
     d8x4_test(true, 0);  // with RLE
     d8x4_test(false, 0); // w/o RLE
     d8x4_test(true, 4);  // with RLE
-    image_test("greyscale.128x128.pgm", false, 0);
-    image_test("greyscale.128x128.pgm", true, 0);
-    image_test("greyscale.640x480.pgm", false, 0);
-    image_test("greyscale.640x480.pgm", true, 0);
-    image_test("greyscale.640x480.pgm", true, 4);
-    image_test("greyscale.640x480.pgm", true, 6);
+    image_compress("greyscale.128x128.pgm", false, 0, option_output);
+    image_compress("greyscale.128x128.pgm", true,  0, option_output);
+    image_compress("greyscale.640x480.pgm", false, 0, option_output);
+    image_compress("greyscale.640x480.pgm", true,  0, option_output);
+    image_compress("greyscale.640x480.pgm", false, 4, option_output);
+    image_compress("greyscale.640x480.pgm", false, 6, option_output);
+    image_compress("greyscale.640x480.pgm", true,  4, option_output);
+    image_compress("greyscale.640x480.pgm", true,  6, option_output);
     return 0;
 }
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
