@@ -239,6 +239,11 @@ static int encode_context(encoder_context_t* context) {
             int predicted = prediction(ctx.x, ctx.y, ctx.a, ctx.b, ctx.c);
             int delta = (byte)predicted - (byte)ctx.v;
             assert((byte)(predicted - delta) == (byte)ctx.v);
+            if (ctx.near > 0) {
+                delta = (128 - ctx.near) * delta / 128;
+                ctx.v = (byte)(predicted - delta);
+                ctx.line[ctx.x] = (byte)ctx.v;  // need to write back resulting value
+            }
             delta = delta < 0 ? delta + 256 : delta;
             delta = delta >= 128 ? delta - 256 : delta;
             // this folds abs(deltas) > 128 to much smaller numbers which is OK
@@ -400,19 +405,18 @@ static void image_test(const char* fn, bool rle, int near) {
     int k = encode(data, w, h, rle, near, encoded, bytes * 3);
     int n = decode(encoded, k, rle, decoded, w, h);
     assert(n == bytes);
+    // even if data has been modified by near > 0:
     assert(memcmp(data, decoded, n) == 0);
     if (near == 0) {
-        assert(memcmp(decoded, data, n) == 0);
-    } else {
-        assert(memcmp(decoded, data, n) == 0);
+        assert(memcmp(decoded, copy, n) == 0);
     }
     char filename[128];
     const char* p = strrchr(fn, '.');
     int len = (int)(p - fn);
     if (near != 0) {
-        sprintf(filename, "%.*s.%snear=%d.png", len, fn, rle ? "rle-" : "", near);
+        sprintf(filename, "%.*s.near=%d.png", len, fn, near);
     } else {
-        sprintf(filename, "%.*s.%sloco.png", len, fn, rle ? "rle-" : "");
+        sprintf(filename, "%.*s.loco%s.png", len, fn, rle ? "-rle" : "");
     }
     stbi_write_png(filename, w, h, 1, decoded, 0);
     if (near != 0) { printf("%s error(rms) = %.1f%c\n", filename, rms(decoded, copy, n) * 100, '%'); }
