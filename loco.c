@@ -129,7 +129,7 @@ static int decode_entropy(byte* input, int bytes, int* pos, int bits) {
 
 enum {
     start_with_bits = 6, // must be the same in encode and decode
-    rle_marker = 511
+    rle_marker = 256
 };
 
 typedef struct run_context_s { // RLE
@@ -173,8 +173,6 @@ typedef struct encoder_context_s {
     int pbp;  // bit position after encoding previous symbol
 } encoder_context_t;
 
-#define ctx (*context) // convenience (eye strain) of "ctx." instead of "context->"
-
 static int estimate_bits_for_run(int bits) {
     int q = rle_marker >> bits;
     if (q >= 15) { return 25 + 8; }
@@ -182,6 +180,7 @@ static int estimate_bits_for_run(int bits) {
 }
 
 static void encode_run(encoder_context_t* context) {
+    #define ctx (*context) // convenience (eye strain) of "ctx." instead of "context->"
     assert(0 < ctx.run.count && ctx.run.count <= 0xFF);
     int bits_for_run = estimate_bits_for_run(ctx.run.bits);
 //  printf("bits_for_run=%d pos-run_pos=%d\n", bits_for_run, ctx.pos - ctx.run.pos);
@@ -203,6 +202,7 @@ static void encode_run(encoder_context_t* context) {
     ctx.run.count = 0;
     // sanity for debug only (not actually needed)
     ctx.run.x = -1; ctx.run.val = -1; ctx.run.pos = -1; ctx.run.bits = -1;
+    #undef ctx
 }
 
 static int prediction(int x, int y, int a, int b, int c) {
@@ -234,20 +234,29 @@ static void neighbors(int x, int y, int w, byte* prev, byte* line, neighbors_t* 
 }
 
 static int encode_context(encoder_context_t* context) {
+    #define ctx (*context) // convenience (eye strain) of "ctx." instead of "context->"
+    const int lossy2p1 = ctx.lossy * 2 + 1;
     for (ctx.y = 0; ctx.y < ctx.h; ctx.y++) {
         for (ctx.x = 0; ctx.x < ctx.w; ctx.x++) {
             ctx.v = (int)ctx.line[ctx.x];
-            if (ctx.rle) {
+            if (ctx.rle && ctx.last >= 0) { // last < 0 at the beginning of each line
                 if (ctx.run.count == 0 && abs(ctx.last - ctx.v) <= ctx.lossy) {
+                    assert(ctx.run.val < 0 && ctx.run.pos < 0 && ctx.run.bits < 0 && ctx.run.x < 0);
                     ctx.run.count = 1;
                     ctx.run.val   = ctx.last;
                     ctx.run.pos   = ctx.pos;
                     ctx.run.bits  = ctx.bits;
                     ctx.run.x     = ctx.x;
-                } else if (abs(ctx.run.val - ctx.v) <= ctx.lossy && ctx.run.count < 0xFF) {
-                    ctx.run.count++;
                 } else if (ctx.run.count != 0) {
-                    encode_run(context);
+                    assert(ctx.run.count > 0);
+                    if (abs(ctx.run.val - ctx.v) <= ctx.lossy && ctx.run.count < 0xFF) {
+                        assert(ctx.run.val >= 0 && ctx.run.pos >= 0 && ctx.run.bits >= 0 && ctx.run.x >= 0);
+                        ctx.run.count++;
+                    } else if (ctx.run.count != 0) {
+                        assert(ctx.run.count > 0);
+                        assert(ctx.run.val >= 0 && ctx.run.pos >= 0 && ctx.run.bits >= 0 && ctx.run.x >= 0);
+                        encode_run(context);
+                    }
                 }
             }
             neighbors(ctx.x, ctx.y, ctx.w, ctx.prev, ctx.line, &ctx.neighbors);
@@ -255,21 +264,13 @@ static int encode_context(encoder_context_t* context) {
             int delta = (byte)ctx.v - (byte)predicted;
             assert((byte)(predicted + delta) == (byte)ctx.v);
             if (ctx.lossy > 0) {
-                #ifdef ANDREYS_LOSSY_ADJUSTMENT // does not work
-                    // lossy adjustment
-                    if (delta > 0) {
-                        delta = (ctx.lossy + delta) / (2 * ctx.lossy + 1);
-                    } else {
-                        delta = - (ctx.lossy - delta) / (2 * ctx.lossy + 1);
-                    }
-                    int r = predicted + ctx.v * (2 * ctx.lossy + 1);
-                    if (r < 0) { r = 0; }
-                    if (r > 255) { r = 255; }
-                    ctx.v = (byte)r;
-                    ctx.line[ctx.x] = (byte)ctx.v;  // need to write back resulting value
-                #endif
-                delta = (128 - ctx.lossy) * delta / 128;
-                ctx.v = (byte)(predicted + delta);
+                // lossy adjustment
+                if (delta >= 0) {
+                    delta = (ctx.lossy + delta) / lossy2p1;
+                } else {
+                    delta = -(ctx.lossy - delta) / lossy2p1;
+                }
+                ctx.v = (byte)(predicted + delta * lossy2p1);
                 ctx.line[ctx.x] = (byte)ctx.v;  // need to write back resulting value
             }
             delta = delta < 0 ? delta + 256 : delta;
@@ -289,7 +290,10 @@ static int encode_context(encoder_context_t* context) {
             ctx.pbp = ctx.pos;
             ctx.last = ctx.v;
         }
-        if (ctx.run.count > 0) { encode_run(context); } // run cannot cross lines
+        if (ctx.run.count > 0) { // run cannot cross lines
+            assert(ctx.run.val >= 0 && ctx.run.pos >= 0 && ctx.run.bits >= 0 && ctx.run.x >= 0);
+            encode_run(context);
+        }
         ctx.prev = ctx.line;
         ctx.line += ctx.w;
         ctx.last = -1;
@@ -308,35 +312,46 @@ static int encode_context(encoder_context_t* context) {
                 ctx.w, ctx.h, ctx.lossy, wh, bytes, bpp, percent, '%', ctx.lossy);
     }
     return bytes;
+    #undef ctx
 }
 
 int encode(byte* data, int w, int h, bool rle, int lossy, byte* output, int max_bytes) {
     assert(lossy >= 0);
-    encoder_context_t context = {};
-    context.rle = rle;
-    context.lossy = lossy;
-    context.data = data;
-    context.w = w;
-    context.h = h;
-    context.output = output;
-    context.max_bytes = max_bytes;
-    context.last = -1;
-    context.run.val  = -1; // first value the a `run'
-    context.run.x    = -1; // start x of last `run'
-    context.run.pos  = -1; // start bit position of a `run'
-    context.run.bits = -1; // bit-width of Golomb entropy encoding at the beginning of a `run'
-    context.bits = start_with_bits; // m = (1 << bits)
-    context.line = data;
-    return encode_context(&context);
+    encoder_context_t ctx = {};
+    ctx.rle = rle;
+    ctx.lossy = lossy;
+    ctx.data = data;
+    ctx.w = w;
+    ctx.h = h;
+    ctx.output = output;
+    ctx.max_bytes = max_bytes;
+    ctx.last = -1;
+    ctx.run.val  = -1; // first value the a `run'
+    ctx.run.x    = -1; // start x of last `run'
+    ctx.run.pos  = -1; // start bit position of a `run'
+    ctx.run.bits = -1; // bit-width of Golomb entropy encoding at the beginning of a `run'
+    ctx.bits = start_with_bits; // m = (1 << bits)
+    ctx.line = data;
+    // shared knowledge between encoder and decoder:
+    // does not have to be encoded in the stream, may as well be simply known by both
+    ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, w, 16);
+    ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, h, 16);
+    ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, lossy, 8);
+    return encode_context(&ctx);
 }
 
-int decode(byte* input, int bytes, bool rle, byte* output, int w, int h) {
+int decode(byte* input, int bytes, bool rle, byte* output, int width, int height, int loss) {
     byte* prev = null;
     byte* line = output;
     int pos = 0; // input bit position
     int bits  = start_with_bits;
     int run = 0;
     int last = -1;
+    const int w = pull_bits(input, bytes, &pos, 16);
+    const int h = pull_bits(input, bytes, &pos, 16);
+    const int lossy = pull_bits(input, bytes, &pos, 8);
+    const int lossy2p1 = lossy * 2 + 1;
+    assert(w == width && h == height && lossy == loss);
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             if (run > 0) {
@@ -369,6 +384,9 @@ int decode(byte* input, int bytes, bool rle, byte* output, int w, int h) {
                     while ((1 << bits) < rice) { bits++; }
                     assert(0 <= rice && rice < 511);
                     int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
+                    if (lossy) {
+                        delta *= lossy2p1;
+                    }
                     int v = (byte)(predicted + delta);
                     assert(0 <= v && v <= 0xFF);
                     line[x] = (byte)v;
@@ -406,7 +424,7 @@ static void d8x4_test(bool rle, int lossy) {
     byte encoded[countof(data) * 2] = {};
     int k = encode(data, w, h, rle, lossy, encoded, countof(encoded));
     byte decoded[countof(data)] = {};
-    int n = decode(encoded, k, rle, decoded, w, h);
+    int n = decode(encoded, k, rle, decoded, w, h, lossy);
     assert(n == countof(data));
     if (lossy == 0) {
         assert(memcmp(decoded, data, n) == 0);
@@ -431,7 +449,7 @@ static void image_compress(const char* fn, bool rle, int lossy, bool write) {
     byte* copy    = (byte*)malloc(bytes);
     memcpy(copy, data, bytes);
     int k = encode(data, w, h, rle, lossy, encoded, bytes * 3);
-    int n = decode(encoded, k, rle, decoded, w, h);
+    int n = decode(encoded, k, rle, decoded, w, h, lossy);
     assert(n == bytes);
     if (lossy == 0) {
         assert(memcmp(decoded, copy, n) == 0);
@@ -546,15 +564,13 @@ int main(int argc, const char* argv[]) {
 //  delta_modulo_folding(63, true);
     d8x4_test(true, 0);  // with RLE
     d8x4_test(false, 0); // w/o RLE
-    d8x4_test(true, 4);  // with RLE
+    d8x4_test(true, 1);  // with RLE
     image_compress("greyscale.128x128.pgm", false, 0, option_output);
     image_compress("greyscale.128x128.pgm", true,  0, option_output);
     image_compress("greyscale.640x480.pgm", false, 0, option_output);
     image_compress("greyscale.640x480.pgm", true,  0, option_output);
-    image_compress("greyscale.640x480.pgm", false, 4, option_output);
-    image_compress("greyscale.640x480.pgm", false, 6, option_output);
-    image_compress("greyscale.640x480.pgm", true,  4, option_output);
-    image_compress("greyscale.640x480.pgm", true,  6, option_output);
+    image_compress("greyscale.640x480.pgm", true,  1, option_output);
+    image_compress("greyscale.640x480.pgm", false, 1, option_output);
     return 0;
 }
 
