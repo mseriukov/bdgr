@@ -495,7 +495,7 @@ static void image_compress(const char* fn, bool rle, int lossy, bool write) {
         const char* p = strrchr(fn, '.');
         int len = (int)(p - fn);
         if (lossy != 0) {
-            sprintf(filename, "%.*s.lossy=%d%s.png", len, fn, lossy, rle ? ".rle" : "");
+            sprintf(filename, "%.*s.lossy(%d)%s.png", len, fn, lossy, rle ? ".rle" : "");
         } else {
             sprintf(filename, "%.*s.loco%s.png", len, fn, rle ? ".rle" : "");
         }
