@@ -37,6 +37,36 @@
 extern "C" {
 #endif
 
+enum {
+    limit = 15,
+    start_with_bits = 4 // must be the same in encode and decode
+};
+
+static int log2n(int v) { // undefined log2(0) assumed to be 1
+    assert(v >= 0);
+    if (v == 0) { return 1; }
+    int k = 0;
+    while ((1 << k) <= v) { k++; }
+    return k;
+}
+
+typedef struct { char text[256]; } str256_t;
+
+static str256_t binary(int v, int p) { // "v" value, "p" precision
+    assert(v >= 0);
+    str256_t str;
+    int i = 0;
+    int k = log2n(v);
+    p = p - k;
+    while (p > 0) { str.text[i] = '0'; i++; p--; }
+    i = i + k;
+    str.text[i] = 0;
+    while (k > 0) { i--; str.text[i] = v % 2 ? '1' : '0'; v >>= 1; k--; }
+    return str;
+}
+
+#define b2s(v, p) (binary(v, p).text)
+
 static void hexdump(byte* data, int bytes) {
     for (int i = 0; i < bytes; i++) { printf("%02X", data[i]); }
     printf("\n");
@@ -82,9 +112,9 @@ static int pull_bits(byte* input, int bytes, int* bp, int bits) {
 }
 
 static int encode_unary(byte* output, int count, int pos, int q) { // encode q as unary
-    if (q >= 15) { // 24 bits versus possible 511 bits is a win? TODO: verify
-        assert(q <= 511);
-        pos = push_bits(output, count, pos, 0xFFFF, 15);
+    if (q >= limit) { // 24 bits versus possible 511 bits is a win? TODO: verify
+        assert(q <= 0xFF);
+        pos = push_bits(output, count, pos, 0xFFFF, limit);
         pos = push_bits(output, count, pos, 0, 1);
         pos = push_bits(output, count, pos, q, 9);
     } else {
@@ -112,8 +142,8 @@ static int decode_unary(byte* input, int bytes, int* pos) {
         if (bit == 0) { break; }
         q++;
     }
-    assert(q <= 15);
-    if (q == 15) {
+    assert(q <= limit);
+    if (q == limit) {
         return pull_bits(input, bytes, pos, 9);
     } else {
         return q;
@@ -127,23 +157,18 @@ static int decode_entropy(byte* input, int bytes, int* pos, int bits) {
     return v;
 }
 
-enum {
-    start_with_bits = 6, // must be the same in encode and decode
-    rle_marker = 256
-};
-
-typedef struct run_context_s { // RLE
+typedef struct rle_s { // RLE
     int count; // number of samples in a `run'
     int val;   // first value the a `run'
     int x;     // start x of last `run'
     int pos;   // start bit position of a `run'
     int bits;  // bit-width of Golomb entropy encoding at the beginning of a `run'
-} run_context_t;
+} rle_t;
 
 typedef struct neighbors_s { // RLE
     int a; //  c b d
-    int c; //  a v
-    int b;
+    int b; //  a v
+    int c;
     int d;
     int d1; // d - b
     int d2; // b - c
@@ -153,8 +178,7 @@ typedef struct neighbors_s { // RLE
 typedef struct encoder_context_s {
     int w;
     int h;
-    bool rle;
-    int  lossy;
+    bool  rle;
     byte* data;
     byte* output;
     int   max_bytes; // number of bytes available in output
@@ -162,48 +186,15 @@ typedef struct encoder_context_s {
     byte* line; // current line
     int   bits; // bit-width of Golomb entropy encoding
     int   last; // last pixel value
-    run_context_t run;
-    int pos; // output bit position
-    int x;
-    int y;
-    int v; // current pixel value at [x,y]
+    int   lossy;
+    int   lossy2p1; // lossy * 2 + 1
+    int   run; // rle number of pixels in a run
+    int   pos; // output bit position
+    int   x;
+    int   y;
+    int   v; // current pixel value at [x,y]
     neighbors_t neighbors;
-//  only for stats and debugging:
-    int rle_saved_bits;
-    int pbp;  // bit position after encoding previous symbol
 } encoder_context_t;
-
-static int estimate_bits_for_run(int bits) {
-    int q = rle_marker >> bits;
-    if (q >= 15) { return 25 + 8; }
-    return q + 1 + bits + 8;
-}
-
-static void encode_run(encoder_context_t* context) {
-    #define ctx (*context) // convenience (eye strain) of "ctx." instead of "context->"
-    assert(0 < ctx.run.count && ctx.run.count <= 0xFF);
-    int bits_for_run = estimate_bits_for_run(ctx.run.bits);
-//  printf("bits_for_run=%d pos-run_pos=%d\n", bits_for_run, ctx.pos - ctx.run.pos);
-    if (ctx.run.pos + bits_for_run < ctx.pos) {
-        ctx.pos = encode_entropy(ctx.output, ctx.max_bytes, ctx.run.pos, rle_marker, ctx.run.bits);
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, ctx.run.count, 8);
-        assert(ctx.run.x + ctx.run.count == ctx.x);
-        for (int i = 0; i < ctx.run.count; i++) { ctx.line[ctx.run.x + i] = (byte)ctx.run.val; }
-//      printf("run %d bits entropy %d bits\n",ctx.pos - ctx.run.pos, ctx.pbp - ctx.run.pos);
-        const int saved_bits = (ctx.pbp - ctx.run.pos) - (ctx.pos - ctx.run.pos);
-        ctx.rle_saved_bits += saved_bits;
-//      printf("encode run %d @%d bits=%d last=0x%02X saved=%d\n",
-//              ctx.run.count, ctx.run.pos, ctx.run.bits, ctx.last, saved_bits);
-        ctx.bits = start_with_bits; // after run expect edge
-    } else {
-//      printf("ignored run=%d run_bits=%d entropy encoded=%d vs bits_for_run=%d bits\n",
-//             ctx.run.count, ctx.run.bits, ctx.pos - ctx.run.pos, bits_for_run);
-    }
-    ctx.run.count = 0;
-    // sanity for debug only (not actually needed)
-    ctx.run.x = -1; ctx.run.val = -1; ctx.run.pos = -1; ctx.run.bits = -1;
-    #undef ctx
-}
 
 static int prediction(int x, int y, int a, int b, int c) {
     if (y == 0) {
@@ -219,8 +210,8 @@ static int prediction(int x, int y, int a, int b, int c) {
     }
 }
 
-static void neighbors(int x, int y, int w, byte* prev, byte* line, neighbors_t* nei) {
-    #define ns (*nei)
+static void neighbors(int x, int y, int w, byte* prev, byte* line, neighbors_t* neighbors) {
+    #define ns (*neighbors)
     //  c b d
     //  a v
     ns.a = x == 0 ? 0 : line[x - 1];
@@ -231,69 +222,111 @@ static void neighbors(int x, int y, int w, byte* prev, byte* line, neighbors_t* 
     ns.d1  = ns.d - ns.b;
     ns.d2  = ns.b - ns.c;
     ns.d3  = ns.c - ns.a;
+    #undef ns
+}
+
+static void encode_delta(encoder_context_t* context, int v);
+
+static void encode_run(encoder_context_t* context) {
+    #define ctx (*context)
+    assert(ctx.run > 0);
+    int count = ctx.run;
+    if (count == 1) { // run == 1 encoded 2 bits as 0xb10
+        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1);
+        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 0, 1);
+    } else if (count <= 5) {
+        count -= 2; // 1 already encoded above 2 -> 0, 3 -> 1, 4 -> 2, 5 -> 3
+        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1);
+        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1);
+        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 0, 1);
+        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, count, 2);
+        // 5 bits 0xb110cc
+    } else {
+        count -= 6;
+        int lb = log2n(count); assert(lb + 2 >= 3);
+//      printf("@%d unary(%d) and %d bits of %d=0b%s\n", ctx.pos, lb + 2, lb, count, b2s(count, lb));
+        ctx.pos = encode_unary(ctx.output, ctx.max_bytes, ctx.pos, lb + 2);
+        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, count, lb);
+        // count 6 -> 0, 7 -> 1                     log2(count) == 1
+        //       8 -> 2, 9 -> 3,                    log2(count) == 2
+        //      10 -> 4, 11 -> 5, 12 -> 6, 13 -> 7  log2(count) == 3
+        // [10..13] encoded as 0b111110ccc (9 bit)
+        // ...
+        // 256-6 = 250 is encoded as 0b11,1111,1111,0,cccc,cccc (10 + 8 = 18 bit)
+    }
+//  printf("encode rle run count=%d @%d [%d,%d] last=%d\n", ctx.run, ctx.pos, ctx.x, ctx.y, ctx.last);
+    ctx.run = 0;
+    #undef ctx
+}
+
+static void encode_rle(encoder_context_t* context) {
+    #define ctx (*context)
+    if (abs(ctx.line[ctx.x] - ctx.last) <= ctx.lossy) {
+        ctx.line[ctx.x] = (byte)ctx.last; // corrected value
+        ctx.run++;
+    } else {
+        if (ctx.run > 0) { encode_run(context); }
+        ctx.pos = push_bits(ctx.output, ctx.max_bytes,ctx.pos, 0, 1);
+        encode_delta(context, ctx.line[ctx.x]);
+    }
+    #undef ctx
+}
+
+static inline bool rle_mode(neighbors_t* neighbors, int lossy) {
+    #define ns (*neighbors)
+    return abs(ns.d1) <= lossy && abs(ns.d2) <= lossy && abs(ns.d3) <= lossy;
+    #undef ns
+}
+
+static void encode_delta(encoder_context_t* context, int v) {
+    #define ctx (*context)
+    ctx.v = v;
+    int predicted = prediction(ctx.x, ctx.y, ctx.neighbors.a, ctx.neighbors.b, ctx.neighbors.c);
+    int delta = (byte)ctx.v - (byte)predicted;
+    assert((byte)(predicted + delta) == (byte)ctx.v);
+    if (ctx.lossy > 0) {
+        // lossy adjustment
+        if (delta >= 0) {
+            delta = (ctx.lossy + delta) / ctx.lossy2p1;
+        } else {
+            delta = -(ctx.lossy - delta) / ctx.lossy2p1;
+        }
+        ctx.v = (byte)(predicted + delta * ctx.lossy2p1); // save reconstructed value
+        ctx.line[ctx.x] = (byte)ctx.v;  // need to write back resulting value
+    }
+    delta = delta < 0 ? delta + 256 : delta;
+    delta = delta >= 128 ? delta - 256 : delta;
+    // this folds abs(deltas) > 128 to much smaller numbers which is OK
+    assert(-128 <= delta && delta <= 127);
+    // delta:    -128 ... -2, -1, 0, +1, +2 ... + 127
+    // positive:                  0,  2,  4       254
+    // negative:  255      3   1
+    int rice = delta >= 0 ? delta * 2 : -delta * 2 - 1;
+    assert(0 <= rice && rice <= 0xFF);
+    int at = ctx.pos;
+    ctx.pos = encode_entropy(ctx.output, ctx.max_bytes, ctx.pos, rice, ctx.bits);
+//  printf("[%3d,%-3d] predicted=%3d v=%3d rice=%4d delta=%4d bits=%d @%d\n",
+//         ctx.x, ctx.y, predicted, ctx.v, rice, delta, ctx.bits, at);
+    ctx.bits = 0;
+    while ((1 << ctx.bits) < rice) { ctx.bits++; }
+    ctx.last = ctx.v;
+    #undef ctx
 }
 
 static int encode_context(encoder_context_t* context) {
-    #define ctx (*context) // convenience (eye strain) of "ctx." instead of "context->"
-    const int lossy2p1 = ctx.lossy * 2 + 1;
+    #define ctx (*context)
     for (ctx.y = 0; ctx.y < ctx.h; ctx.y++) {
         for (ctx.x = 0; ctx.x < ctx.w; ctx.x++) {
-            ctx.v = (int)ctx.line[ctx.x];
-            if (ctx.rle && ctx.last >= 0) { // last < 0 at the beginning of each line
-                if (ctx.run.count == 0 && abs(ctx.last - ctx.v) <= ctx.lossy) {
-                    assert(ctx.run.val < 0 && ctx.run.pos < 0 && ctx.run.bits < 0 && ctx.run.x < 0);
-                    ctx.run.count = 1;
-                    ctx.run.val   = ctx.last;
-                    ctx.run.pos   = ctx.pos;
-                    ctx.run.bits  = ctx.bits;
-                    ctx.run.x     = ctx.x;
-                } else if (ctx.run.count != 0) {
-                    assert(ctx.run.count > 0);
-                    if (abs(ctx.run.val - ctx.v) <= ctx.lossy && ctx.run.count < 0xFF) {
-                        assert(ctx.run.val >= 0 && ctx.run.pos >= 0 && ctx.run.bits >= 0 && ctx.run.x >= 0);
-                        ctx.run.count++;
-                    } else if (ctx.run.count != 0) {
-                        assert(ctx.run.count > 0);
-                        assert(ctx.run.val >= 0 && ctx.run.pos >= 0 && ctx.run.bits >= 0 && ctx.run.x >= 0);
-                        encode_run(context);
-                    }
-                }
-            }
             neighbors(ctx.x, ctx.y, ctx.w, ctx.prev, ctx.line, &ctx.neighbors);
-            int predicted = prediction(ctx.x, ctx.y, ctx.neighbors.a, ctx.neighbors.b, ctx.neighbors.c);
-            int delta = (byte)ctx.v - (byte)predicted;
-            assert((byte)(predicted + delta) == (byte)ctx.v);
-            if (ctx.lossy > 0) {
-                // lossy adjustment
-                if (delta >= 0) {
-                    delta = (ctx.lossy + delta) / lossy2p1;
-                } else {
-                    delta = -(ctx.lossy - delta) / lossy2p1;
-                }
-                ctx.v = (byte)(predicted + delta * lossy2p1);
-                ctx.line[ctx.x] = (byte)ctx.v;  // need to write back resulting value
+            // last == -1 at the beginning of line
+            if (ctx.rle && ctx.last >= 0 && rle_mode(&ctx.neighbors, ctx.lossy)) {
+                encode_rle(context);
+            } else {
+                if (ctx.run > 0) { encode_run(context); }
+                encode_delta(context, ctx.line[ctx.x]);
             }
-            delta = delta < 0 ? delta + 256 : delta;
-            delta = delta >= 128 ? delta - 256 : delta;
-            // this folds abs(deltas) > 128 to much smaller numbers which is OK
-            assert(-128 <= delta && delta <= 127);
-            // delta:    -128 ... -2, -1, 0, +1, +2 ... + 127
-            // positive:                  0,  2,  4       254
-            // negative:  255      3   1
-            int rice = delta >= 0 ? delta * 2 : -delta * 2 - 1;
-            assert(0 <= rice && rice < rle_marker);
-            ctx.pos = encode_entropy(ctx.output, ctx.max_bytes, ctx.pos, rice, ctx.bits);
-//          printf("[%3d,%-3d] predicted=%3d v=%3d rice=%4d delta=%4d bits=%d run=%d pushed_out_bits=%d\n",
-//                 ctx.x, ctx.y, predicted, ctx.v, rice, delta, ctx.bits, ctx.run.count, ctx.pos - ctx.pbp);
-            ctx.bits = 0;
-            while ((1 << ctx.bits) < rice) { ctx.bits++; }
-            ctx.pbp = ctx.pos;
-            ctx.last = ctx.v;
         }
-        if (ctx.run.count > 0) { // run cannot cross lines
-            assert(ctx.run.val >= 0 && ctx.run.pos >= 0 && ctx.run.bits >= 0 && ctx.run.x >= 0);
-            encode_run(context);
-        }
+        if (ctx.run > 0) { encode_run(context); }
         ctx.prev = ctx.line;
         ctx.line += ctx.w;
         ctx.last = -1;
@@ -304,11 +337,10 @@ static int encode_context(encoder_context_t* context) {
     const double bpp = ctx.pos / (double)wh;
     const double percent = 100.0 * bytes / wh;
     if (ctx.rle) {
-        printf("%dx%d (%d) %d->%d bytes %.3f bpp %.1f%c RLE saved %d bytes (lossy=%d)\n",
-                ctx.w, ctx.h, ctx.lossy, wh, bytes, bpp, percent, '%',
-                ctx.rle_saved_bits / 8, ctx.lossy);
+        printf("%dx%d (%d) %d->%d bytes %.3f bpp %.1f%c lossy(%d) RLE\n",
+                ctx.w, ctx.h, ctx.lossy, wh, bytes, bpp, percent, '%', ctx.lossy);
     } else {
-        printf("%dx%d (%d) %d->%d bytes %.3f bpp %.1f%c no RLE (lossy=%d)\n",
+        printf("%dx%d (%d) %d->%d bytes %.3f bpp %.1f%c lossy(%d)\n",
                 ctx.w, ctx.h, ctx.lossy, wh, bytes, bpp, percent, '%', ctx.lossy);
     }
     return bytes;
@@ -320,16 +352,13 @@ int encode(byte* data, int w, int h, bool rle, int lossy, byte* output, int max_
     encoder_context_t ctx = {};
     ctx.rle = rle;
     ctx.lossy = lossy;
+    ctx.lossy2p1 = ctx.lossy * 2 + 1;
     ctx.data = data;
     ctx.w = w;
     ctx.h = h;
     ctx.output = output;
     ctx.max_bytes = max_bytes;
     ctx.last = -1;
-    ctx.run.val  = -1; // first value the a `run'
-    ctx.run.x    = -1; // start x of last `run'
-    ctx.run.pos  = -1; // start bit position of a `run'
-    ctx.run.bits = -1; // bit-width of Golomb entropy encoding at the beginning of a `run'
     ctx.bits = start_with_bits; // m = (1 << bits)
     ctx.line = data;
     // shared knowledge between encoder and decoder:
@@ -340,12 +369,28 @@ int encode(byte* data, int w, int h, bool rle, int lossy, byte* output, int max_
     return encode_context(&ctx);
 }
 
+static int decode_run(byte* input, int bytes, int *pos) { // return run count
+    int bit = pull_bits(input, bytes, pos, 1);
+    if (bit == 0) { return 1; }
+    bit = pull_bits(input, bytes, pos, 1);
+    if (bit == 0) {
+        return pull_bits(input, bytes, pos, 2) + 2;
+    } else {
+        int lb = 3;
+        for (;;) {
+            if (pull_bits(input, bytes, pos, 1) == 0) { break; }
+            lb++;
+        }
+        assert(lb >= 3);
+        return pull_bits(input, bytes, pos, lb - 2) + 6;
+    }
+}
+
 int decode(byte* input, int bytes, bool rle, byte* output, int width, int height, int loss) {
     byte* prev = null;
     byte* line = output;
     int pos = 0; // input bit position
     int bits  = start_with_bits;
-    int run = 0;
     int last = -1;
     const int w = pull_bits(input, bytes, &pos, 16);
     const int h = pull_bits(input, bytes, &pos, 16);
@@ -354,48 +399,38 @@ int decode(byte* input, int bytes, bool rle, byte* output, int width, int height
     assert(w == width && h == height && lossy == loss);
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
-            if (run > 0) {
-                line[x] = (byte)last;
-                run--;
-                if (run == 0) {
-//                  printf("run ends at [%d,%d]\n", x, y);
-                    bits = start_with_bits; // expected edge after run
-                }
+            neighbors_t nei;
+            neighbors(x, y, w, prev, line, &nei);
+            bool run_mode = rle && last >= 0 && rle_mode(&nei, lossy);
+            if (run_mode) {
+                run_mode = pull_bits(input, bytes, &pos, 1) != 0;
+            }
+            if (run_mode) {
+                int count = decode_run(input, bytes, &pos);
+//              printf("decode rle run count=%d @%d [%d,%d] last=%d\n", count, pos, x + count, y, last);
+                while (count > 0) { line[x] = (byte)last; x++; count--; }
+                assert(x <= w);
+                x--; // because it will be incremented by for loop above
             } else {
-                neighbors_t nei;
-                neighbors(x, y, w, prev, line, &nei);
                 int predicted = prediction(x, y, nei.a, nei.b, nei.c);
+                int at = pos; // only for printf below
                 int rice = decode_entropy(input, bytes, &pos, bits);
-                if (!rle) {
-                    assert(0 <= rice && rice < rle_marker);
-                } else {
-                    assert(0 <= rice && rice <= rle_marker);
+                assert(0 <= rice && rice <= 0xFF);
+                int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
+                if (lossy > 0) {
+                    delta *= lossy2p1;
                 }
-                if (rle && rice == rle_marker) {
-                    int at = pos; // only for printf below
-                    run = pull_bits(input, bytes, &pos, 8); // RLE count
-//                  printf("decode run %d @%d bits=%d last@[%d,%d]=0x%02X\n", run, at, bits, x, y, last);
-                    assert(run >= 1); // the very last run can be 1 byte
-                    line[x] = (byte)last;
-                    run--;
-                    if (run == 0) { bits = start_with_bits; } // expected edge after run
-                } else {
-                    bits = 0;
-                    while ((1 << bits) < rice) { bits++; }
-                    assert(0 <= rice && rice < 511);
-                    int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
-                    if (lossy) {
-                        delta *= lossy2p1;
-                    }
-                    int v = (byte)(predicted + delta);
-                    assert(0 <= v && v <= 0xFF);
-                    line[x] = (byte)v;
-                    last = v;
-//                  printf("[%3d,%-3d] predicted=%3d v=%3d rice=%4d delta=%4d bits=%d\n",
-//                         x, y, predicted, v, rle ? rice + 1 : rice, delta, bits);
-                }
+                int v = (byte)(predicted + delta);
+                assert(0 <= v && v <= 0xFF);
+                line[x] = (byte)v;
+                last = v;
+//              printf("[%3d,%-3d] predicted=%3d v=%3d rice=%4d delta=%4d bits=%d @%d\n",
+//                      x, y, predicted, v, rice, delta, bits, at);
+                bits = 0;
+                while ((1 << bits) < rice) { bits++; }
             }
         }
+        last = -1;
         prev = line;
         line += w;
         bits = start_with_bits;
@@ -429,9 +464,8 @@ static void d8x4_test(bool rle, int lossy) {
     if (lossy == 0) {
         assert(memcmp(decoded, data, n) == 0);
     } else {
-        // TODO: calculate and print abs(error)
+        printf("error(rms) = %.1f%c\n", rms(decoded, copy, n) * 100, '%');
     }
-    printf("error(rms) = %.1f%c\n", rms(decoded, copy, n) * 100, '%');
 }
 
 static bool option_output;
@@ -453,18 +487,19 @@ static void image_compress(const char* fn, bool rle, int lossy, bool write) {
     assert(n == bytes);
     if (lossy == 0) {
         assert(memcmp(decoded, copy, n) == 0);
+    } else {
+        printf("error(rms) = %.1f%c\n", rms(decoded, copy, n) * 100, '%');
     }
     if (write) {
         char filename[128];
         const char* p = strrchr(fn, '.');
         int len = (int)(p - fn);
         if (lossy != 0) {
-            sprintf(filename, "%.*s.lossy=%d%s.png", len, fn, lossy, rle ? "-rle" : "");
+            sprintf(filename, "%.*s.lossy=%d%s.png", len, fn, lossy, rle ? ".rle" : "");
         } else {
-            sprintf(filename, "%.*s.loco%s.png", len, fn, rle ? "-rle" : "");
+            sprintf(filename, "%.*s.loco%s.png", len, fn, rle ? ".rle" : "");
         }
         stbi_write_png(filename, w, h, 1, decoded, 0);
-        if (lossy != 0) { printf("%s error(rms) = %.1f%c\n", filename, rms(decoded, copy, n) * 100, '%'); }
     }
     free(copy);
     free(encoded);
@@ -521,8 +556,8 @@ static void compress_folder(const char* folder_name) {
         printf("%s%s\n", pathname, suffix);
         image_compress(pathname, false, 0, false);
         image_compress(pathname, true,  0, false);
-        image_compress(pathname, false, 4, false);
-        image_compress(pathname, true,  4, false);
+        image_compress(pathname, false, 1, false);
+        image_compress(pathname, true,  1, false);
         free(pathname);
     }
     folder_close(folders);
@@ -557,20 +592,24 @@ int main(int argc, const char* argv[]) {
     setbuf(stdout, null);
     argc = option_bool(argc, argv, "-o", &option_output);
     argc = option_int(argc, argv, "-n=%d", &option_lossy);
+    delta_modulo_folding(1, false);
+//  delta_modulo_folding(63, true);
+    d8x4_test(true, 1);  // with RLE lossy
+    d8x4_test(false, 0); // w/o RLE
+    d8x4_test(true, 0);  // with RLE lossless
+    image_compress("greyscale.128x128.pgm", false, 0, option_output);
+    image_compress("greyscale.128x128.pgm", true,  0, option_output);
+    image_compress("greyscale.128x128.pgm", true,  1, option_output);
+    image_compress("greyscale.640x480.pgm", false, 0, option_output);
+    image_compress("greyscale.640x480.pgm", true,  0, option_output);
+    image_compress("greyscale.640x480.pgm", false, 1, option_output);
+    image_compress("greyscale.640x480.pgm", true,  1, option_output);
+    image_compress("greyscale.640x480.pgm", true,  2, option_output);
+    image_compress("greyscale.640x480.pgm", true,  3, option_output);
+    image_compress("greyscale.640x480.pgm", true,  4, option_output);
     if (argc > 1 && is_folder(argv[1])) {
         compress_folder(argv[1]);
     }
-    delta_modulo_folding(1, false);
-//  delta_modulo_folding(63, true);
-    d8x4_test(true, 0);  // with RLE
-    d8x4_test(false, 0); // w/o RLE
-    d8x4_test(true, 1);  // with RLE
-    image_compress("greyscale.128x128.pgm", false, 0, option_output);
-    image_compress("greyscale.128x128.pgm", true,  0, option_output);
-    image_compress("greyscale.640x480.pgm", false, 0, option_output);
-    image_compress("greyscale.640x480.pgm", true,  0, option_output);
-    image_compress("greyscale.640x480.pgm", true,  1, option_output);
-    image_compress("greyscale.640x480.pgm", false, 1, option_output);
     return 0;
 }
 
