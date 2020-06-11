@@ -188,7 +188,6 @@ typedef struct encoder_context_s {
     int   last; // last pixel value
     int   lossy;
     int   lossy2p1; // lossy * 2 + 1
-    int   run; // rle number of pixels in a run
     int   pos; // output bit position
     int   x;
     int   y;
@@ -227,10 +226,8 @@ static void neighbors(int x, int y, int w, byte* prev, byte* line, neighbors_t* 
 
 static void encode_delta(encoder_context_t* context, int v);
 
-static void encode_run(encoder_context_t* context) {
+static void encode_run(encoder_context_t* context, int count) {
     #define ctx (*context)
-    assert(ctx.run > 0);
-    int count = ctx.run;
     if (count == 1) { // run == 1 encoded 2 bits as 0xb10
         ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1);
         ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 0, 1);
@@ -255,17 +252,21 @@ static void encode_run(encoder_context_t* context) {
         // 256-6 = 250 is encoded as 0b11,1111,1111,0,cccc,cccc (10 + 8 = 18 bit)
     }
 //  printf("encode rle run count=%d @%d [%d,%d] last=%d\n", ctx.run, ctx.pos, ctx.x, ctx.y, ctx.last);
-    ctx.run = 0;
     #undef ctx
 }
 
 static void encode_rle(encoder_context_t* context) {
     #define ctx (*context)
-    if (abs(ctx.line[ctx.x] - ctx.last) <= ctx.lossy) {
+    int count = 0; // rle number of pixels in a run
+    while (abs(ctx.line[ctx.x] - ctx.last) <= ctx.lossy && ctx.x < ctx.w) {
         ctx.line[ctx.x] = (byte)ctx.last; // corrected value
-        ctx.run++;
+        ctx.x++;
+        count++;
+    }
+    if (count > 0) {
+        encode_run(context, count);
+        ctx.x--; // will be incremented by for(x) loop
     } else {
-        if (ctx.run > 0) { encode_run(context); }
         ctx.pos = push_bits(ctx.output, ctx.max_bytes,ctx.pos, 0, 1);
         encode_delta(context, ctx.line[ctx.x]);
     }
@@ -322,11 +323,9 @@ static int encode_context(encoder_context_t* context) {
             if (ctx.rle && ctx.last >= 0 && rle_mode(&ctx.neighbors, ctx.lossy)) {
                 encode_rle(context);
             } else {
-                if (ctx.run > 0) { encode_run(context); }
                 encode_delta(context, ctx.line[ctx.x]);
             }
         }
-        if (ctx.run > 0) { encode_run(context); }
         ctx.prev = ctx.line;
         ctx.line += ctx.w;
         ctx.last = -1;
