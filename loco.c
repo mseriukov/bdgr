@@ -113,10 +113,8 @@ static int pull_bits(byte* input, int bytes, int* bp, int bits) {
     return v;
 }
 
-static int stats_una[256];
 
 static int encode_unary(byte* output, int count, int pos, int q) { // encode q as unary
-    stats_una[q]++;
     if (q >= limit) { // 24 bits versus possible 511 bits is a win? TODO: verify
         assert(q <= 0xFF);
         assert(limit <= 31);
@@ -130,21 +128,15 @@ static int encode_unary(byte* output, int count, int pos, int q) { // encode q a
     return pos;
 }
 
-static int stats_ent[256];
-static int stats_opt[256];
-
 static int encode_entropy(byte* output, int count, int pos, int v, int bits) {
     // simple entropy encoding https://en.wikipedia.org/wiki/Golomb_coding for now
     // can be improved to https://en.wikipedia.org/wiki/Asymmetric_numeral_systems
+    assert(0 <= v && v <= 0xFF);
     const int m = 1 << bits;
     int q = v >> bits; // v / m quotient
-int start = pos;
     pos = encode_unary(output, count, pos, q);
     const int r = v & (m - 1); // v % m reminder (bits)
     pos = push_bits(output, count, pos, r, bits);
-assert(0 <= v && v <= 0xFF);
-stats_ent[v] += pos - start; // q + 1 + bits but we have limit too!
-stats_opt[v] += v == 0 ? 1 : 1 + log2n(v);
     return pos;
 }
 
@@ -206,7 +198,6 @@ typedef struct encoder_context_s {
     int   y;
     int   v; // current pixel value at [x,y]
     neighbors_t neighbors;
-    int rle_stats[1024];
 } encoder_context_t;
 
 static int prediction(int x, int y, int a, int b, int c) {
@@ -242,7 +233,6 @@ static void encode_delta(encoder_context_t* context, int v);
 
 static void encode_run(encoder_context_t* context, int count) {
     #define ctx (*context)
-    ctx.rle_stats[count]++;
     if (count == 1) { // run == 1 encoded 2 bits as 0xb10
         ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1);
         ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 0, 1);
@@ -350,21 +340,7 @@ static int encode_context(encoder_context_t* context) {
         ctx.last = -1;
         ctx.bits = start_with_bits;
     }
-    const int bytes = (ctx.pos + 7) / 8;
-    const int wh = ctx.w * ctx.h;
-    const double bpp = ctx.pos / (double)wh;
-    const double percent = 100.0 * bytes / wh;
-    if (ctx.rle) {
-        printf("%dx%d (%d) %d->%d bytes %.3f bpp %.1f%c lossy(%d) RLE\n",
-                ctx.w, ctx.h, ctx.lossy, wh, bytes, bpp, percent, '%', ctx.lossy);
-    } else {
-        printf("%dx%d (%d) %d->%d bytes %.3f bpp %.1f%c lossy(%d)\n",
-                ctx.w, ctx.h, ctx.lossy, wh, bytes, bpp, percent, '%', ctx.lossy);
-    }
-//  for (int i = 0; i < countof(ctx.rle_stats); i++) {
-//      if (ctx.rle_stats[i] != 0) { printf("RLE %d = %d\n", i, ctx.rle_stats[i]); }
-//  }
-    return bytes;
+    return (ctx.pos + 7) / 8;
     #undef ctx
 }
 
@@ -489,6 +465,12 @@ static void d8x4_test(bool rle, int lossy) {
     } else {
         printf("error(rms) = %.1f%c\n", rms(decoded, copy, n) * 100, '%');
     }
+
+    const int wh = w * h;
+    const double bpp = k * 8 / (double)wh;
+    const double percent = 100.0 * k / wh;
+    printf("%dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s\n",
+            w, h, wh, bytes, bpp, percent, '%', lossy, rle ? " RLE" : "");
 }
 
 static bool option_output;
@@ -510,19 +492,30 @@ static void image_compress(const char* fn, bool rle, int lossy, bool write) {
     assert(n == bytes);
     if (lossy == 0) {
         assert(memcmp(decoded, copy, n) == 0);
+    }
+    char filename[128];
+    const char* p = strrchr(fn, '.');
+    int len = (int)(p - fn);
+    if (lossy != 0) {
+        sprintf(filename, "%.*s.lossy(%d)%s.png", len, fn, lossy, rle ? ".rle" : "");
     } else {
-        printf("error(rms) = %.1f%c\n", rms(decoded, copy, n) * 100, '%');
+        sprintf(filename, "%.*s.loco%s.png", len, fn, rle ? ".rle" : "");
     }
     if (write) {
-        char filename[128];
-        const char* p = strrchr(fn, '.');
-        int len = (int)(p - fn);
-        if (lossy != 0) {
-            sprintf(filename, "%.*s.lossy(%d)%s.png", len, fn, lossy, rle ? ".rle" : "");
-        } else {
-            sprintf(filename, "%.*s.loco%s.png", len, fn, rle ? ".rle" : "");
-        }
         stbi_write_png(filename, w, h, 1, decoded, 0);
+    }
+    const int wh = w * h;
+    const double bpp = k * 8 / (double)wh;
+    const double percent = 100.0 * k / wh;
+    const char* file = strrchr(fn, '/');
+    if (file == null) { file = fn; } else { file++; }
+    if (lossy == 0) {
+        printf("%s %dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s\n",
+                file, w, h, wh, bytes, bpp, percent, '%', lossy, rle ? " RLE" : "");
+    } else {
+        printf("%s %dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s rms(err) = %.1f%c\n",
+                file, w, h, wh, bytes, bpp, percent, '%', lossy, rle ? " RLE" : "",
+                rms(decoded, copy, n) * 100, '%');
     }
     free(copy);
     free(encoded);
@@ -617,46 +610,6 @@ int main(int argc, const char* argv[]) {
     argc = option_int(argc, argv, "-n=%d", &option_lossy);
     delta_modulo_folding(1, false);
 //  delta_modulo_folding(63, true);
-
-    image_compress("thermo-foil.png", false, 0, option_output);
-static int stats_sum[256];
-int sum_ent = 0;
-int sum_opt = 0;
-for (int i = 0; i < countof(stats_ent); i++) {
-    for (int j = 0; j <= i; j++) { stats_sum[i] += stats_ent[j]; }
-    sum_ent += stats_ent[i];
-    sum_opt += stats_opt[i];
-}
-for (int i = 0; i < countof(stats_ent); i++) {
-    double percent = stats_sum[i] * 100.0 / sum_ent;
-    if (stats_opt[i] != 0) {
-        printf("%4d ent=%6d opt=%6d ent/opt=%.1f %.1f%c\n",
-               i, stats_ent[i], stats_opt[i], (double)stats_ent[i] / stats_opt[i],
-               percent, '%');
-    }
-}
-printf("ent=%d bits %d bytes opt=%d bits %d bytes opt/ent=%.3f\n",
-        sum_ent, sum_ent / 8, sum_opt, sum_opt / 8, sum_opt / (double)sum_ent);
-printf("%.1f%c %.1f%c\n",
-        (sum_ent / 8 * 100.0) / (640 * 480), '%',
-        (sum_opt / 8 * 100.0) / (640 * 480), '%');
-
-printf("unary counts:\n");
-
-static int stats_una_sum[256];
-int sum_una = 0;
-for (int i = 0; i < countof(stats_ent); i++) {
-    for (int j = 0; j <= i; j++) { stats_una_sum[i] += stats_una[j]; }
-    sum_una += stats_una[i];
-}
-
-for (int i = 0; i < countof(stats_una); i++) {
-    double percent = stats_una_sum[i] * 100.0 / sum_una;
-    if (stats_una[i] != 0) {
-        printf("%2d %6d %.1f\n", i, stats_una[i], percent);
-    }
-}
-if (1) return 0;
     d8x4_test(true, 1);  // with RLE lossy
     d8x4_test(false, 0); // w/o RLE
     d8x4_test(true, 0);  // with RLE lossless
@@ -670,6 +623,7 @@ if (1) return 0;
     image_compress("greyscale.640x480.pgm", true,  2, option_output);
     image_compress("greyscale.640x480.pgm", true,  3, option_output);
     image_compress("greyscale.640x480.pgm", true,  4, option_output);
+    image_compress("thermo-foil.png", true, 1, option_output);
     if (argc > 1 && is_folder(argv[1])) {
         compress_folder(argv[1]);
     }
