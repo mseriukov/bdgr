@@ -38,9 +38,11 @@ extern "C" {
 #endif
 
 enum {
-    limit = 15,
-    start_with_bits = 4 // must be the same in encode and decode
+    limit = 15, // unary encoding bit limit
+    start_with_bits = 3 // must be the same in encode and decode
 };
+
+// consider limit = 10 and start_with_bits = 2 for IR images
 
 static int log2n(int v) { // undefined log2(0) assumed to be 1
     assert(v >= 0);
@@ -83,7 +85,7 @@ static double rms(byte* a, byte* b, int n) {
 
 static int push_bits(byte* output, int bytes, int pos, int v, int bits) {
     assert(0 <= v);
-    assert(bits < 31);
+    assert(bits <= 31);
     for (int i = 0; i < bits; i++) {
         const int bit_pos = (pos + i) % 8;
         const int byte_pos = (pos + i) / 8;
@@ -111,12 +113,16 @@ static int pull_bits(byte* input, int bytes, int* bp, int bits) {
     return v;
 }
 
+static int stats_una[256];
+
 static int encode_unary(byte* output, int count, int pos, int q) { // encode q as unary
+    stats_una[q]++;
     if (q >= limit) { // 24 bits versus possible 511 bits is a win? TODO: verify
         assert(q <= 0xFF);
-        pos = push_bits(output, count, pos, 0xFFFF, limit);
+        assert(limit <= 31);
+        pos = push_bits(output, count, pos, 0x7FFFFFFF, limit);
         pos = push_bits(output, count, pos, 0, 1);
-        pos = push_bits(output, count, pos, q, 9);
+        pos = push_bits(output, count, pos, q, 8);
     } else {
         while (q > 0) { pos = push_bits(output, count, pos, 1, 1); q--; }
         pos = push_bits(output, count, pos, 0, 1);
@@ -124,14 +130,21 @@ static int encode_unary(byte* output, int count, int pos, int q) { // encode q a
     return pos;
 }
 
+static int stats_ent[256];
+static int stats_opt[256];
+
 static int encode_entropy(byte* output, int count, int pos, int v, int bits) {
     // simple entropy encoding https://en.wikipedia.org/wiki/Golomb_coding for now
     // can be improved to https://en.wikipedia.org/wiki/Asymmetric_numeral_systems
     const int m = 1 << bits;
     int q = v >> bits; // v / m quotient
+int start = pos;
     pos = encode_unary(output, count, pos, q);
     const int r = v & (m - 1); // v % m reminder (bits)
     pos = push_bits(output, count, pos, r, bits);
+assert(0 <= v && v <= 0xFF);
+stats_ent[v] += pos - start; // q + 1 + bits but we have limit too!
+stats_opt[v] += v == 0 ? 1 : 1 + log2n(v);
     return pos;
 }
 
@@ -144,7 +157,7 @@ static int decode_unary(byte* input, int bytes, int* pos) {
     }
     assert(q <= limit);
     if (q == limit) {
-        return pull_bits(input, bytes, pos, 9);
+        return pull_bits(input, bytes, pos, 8);
     } else {
         return q;
     }
@@ -193,6 +206,7 @@ typedef struct encoder_context_s {
     int   y;
     int   v; // current pixel value at [x,y]
     neighbors_t neighbors;
+    int rle_stats[1024];
 } encoder_context_t;
 
 static int prediction(int x, int y, int a, int b, int c) {
@@ -228,6 +242,7 @@ static void encode_delta(encoder_context_t* context, int v);
 
 static void encode_run(encoder_context_t* context, int count) {
     #define ctx (*context)
+    ctx.rle_stats[count]++;
     if (count == 1) { // run == 1 encoded 2 bits as 0xb10
         ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1);
         ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 0, 1);
@@ -279,6 +294,8 @@ static inline bool rle_mode(neighbors_t* neighbors, int lossy) {
     #undef ns
 }
 
+static int verify[1024][1024];
+
 static void encode_delta(encoder_context_t* context, int v) {
     #define ctx (*context)
     ctx.v = v;
@@ -305,11 +322,13 @@ static void encode_delta(encoder_context_t* context, int v) {
     int rice = delta >= 0 ? delta * 2 : -delta * 2 - 1;
     assert(0 <= rice && rice <= 0xFF);
     int at = ctx.pos;
+verify[ctx.x][ctx.y] = at;
     ctx.pos = encode_entropy(ctx.output, ctx.max_bytes, ctx.pos, rice, ctx.bits);
 //  printf("[%3d,%-3d] predicted=%3d v=%3d rice=%4d delta=%4d bits=%d @%d\n",
 //         ctx.x, ctx.y, predicted, ctx.v, rice, delta, ctx.bits, at);
     ctx.bits = 0;
     while ((1 << ctx.bits) < rice) { ctx.bits++; }
+//if (ctx.bits > 1 ) { ctx.bits = log2n(rice); }
     ctx.last = ctx.v;
     #undef ctx
 }
@@ -342,6 +361,9 @@ static int encode_context(encoder_context_t* context) {
         printf("%dx%d (%d) %d->%d bytes %.3f bpp %.1f%c lossy(%d)\n",
                 ctx.w, ctx.h, ctx.lossy, wh, bytes, bpp, percent, '%', ctx.lossy);
     }
+//  for (int i = 0; i < countof(ctx.rle_stats); i++) {
+//      if (ctx.rle_stats[i] != 0) { printf("RLE %d = %d\n", i, ctx.rle_stats[i]); }
+//  }
     return bytes;
     #undef ctx
 }
@@ -425,8 +447,10 @@ int decode(byte* input, int bytes, bool rle, byte* output, int width, int height
                 last = v;
 //              printf("[%3d,%-3d] predicted=%3d v=%3d rice=%4d delta=%4d bits=%d @%d\n",
 //                      x, y, predicted, v, rice, delta, bits, at);
+assert(at == verify[x][y]);
                 bits = 0;
                 while ((1 << bits) < rice) { bits++; }
+//if (bits > 1) { bits = log2n(rice); }
             }
         }
         last = -1;
@@ -593,6 +617,46 @@ int main(int argc, const char* argv[]) {
     argc = option_int(argc, argv, "-n=%d", &option_lossy);
     delta_modulo_folding(1, false);
 //  delta_modulo_folding(63, true);
+
+    image_compress("thermo-foil.png", false, 0, option_output);
+static int stats_sum[256];
+int sum_ent = 0;
+int sum_opt = 0;
+for (int i = 0; i < countof(stats_ent); i++) {
+    for (int j = 0; j <= i; j++) { stats_sum[i] += stats_ent[j]; }
+    sum_ent += stats_ent[i];
+    sum_opt += stats_opt[i];
+}
+for (int i = 0; i < countof(stats_ent); i++) {
+    double percent = stats_sum[i] * 100.0 / sum_ent;
+    if (stats_opt[i] != 0) {
+        printf("%4d ent=%6d opt=%6d ent/opt=%.1f %.1f%c\n",
+               i, stats_ent[i], stats_opt[i], (double)stats_ent[i] / stats_opt[i],
+               percent, '%');
+    }
+}
+printf("ent=%d bits %d bytes opt=%d bits %d bytes opt/ent=%.3f\n",
+        sum_ent, sum_ent / 8, sum_opt, sum_opt / 8, sum_opt / (double)sum_ent);
+printf("%.1f%c %.1f%c\n",
+        (sum_ent / 8 * 100.0) / (640 * 480), '%',
+        (sum_opt / 8 * 100.0) / (640 * 480), '%');
+
+printf("unary counts:\n");
+
+static int stats_una_sum[256];
+int sum_una = 0;
+for (int i = 0; i < countof(stats_ent); i++) {
+    for (int j = 0; j <= i; j++) { stats_una_sum[i] += stats_una[j]; }
+    sum_una += stats_una[i];
+}
+
+for (int i = 0; i < countof(stats_una); i++) {
+    double percent = stats_una_sum[i] * 100.0 / sum_una;
+    if (stats_una[i] != 0) {
+        printf("%2d %6d %.1f\n", i, stats_una[i], percent);
+    }
+}
+if (1) return 0;
     d8x4_test(true, 1);  // with RLE lossy
     d8x4_test(false, 0); // w/o RLE
     d8x4_test(true, 0);  // with RLE lossless
