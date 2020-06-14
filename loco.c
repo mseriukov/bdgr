@@ -465,16 +465,16 @@ static void d8x4_test(bool rle, int lossy) {
     } else {
         printf("error(rms) = %.1f%c\n", rms(decoded, copy, n) * 100, '%');
     }
-
     const int wh = w * h;
     const double bpp = k * 8 / (double)wh;
     const double percent = 100.0 * k / wh;
     printf("%dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s\n",
-            w, h, wh, bytes, bpp, percent, '%', lossy, rle ? " RLE" : "");
+            w, h, wh, k, bpp, percent, '%', lossy, rle ? " RLE" : "");
 }
 
 static bool option_output;
 static int  option_lossy;
+static int  option_threshold;
 
 static void image_compress(const char* fn, bool rle, int lossy, bool write) {
     int w = 0;
@@ -483,6 +483,12 @@ static void image_compress(const char* fn, bool rle, int lossy, bool write) {
     byte* data = stbi_load(fn, &w, &h, &c, 0);
     assert(c == 1);
     int bytes = w * h;
+    if (option_threshold != 0) {
+        assert(0 < option_threshold && option_threshold <= 0xFF);
+        for (int i = 0; i < bytes; i++) {
+            if (data[i] < option_threshold) { data[i] = 0; }
+        }
+    }
     byte* encoded = (byte*)malloc(bytes * 3);
     byte* decoded = (byte*)malloc(bytes);
     byte* copy    = (byte*)malloc(bytes);
@@ -501,20 +507,20 @@ static void image_compress(const char* fn, bool rle, int lossy, bool write) {
     } else {
         sprintf(filename, "%.*s.loco%s.png", len, fn, rle ? ".rle" : "");
     }
+    const char* file = strrchr(filename, '/');
+    if (file == null) { file = filename; } else { file++; }
     if (write) {
-        stbi_write_png(filename, w, h, 1, decoded, 0);
+        stbi_write_png(file, w, h, 1, decoded, 0);
     }
     const int wh = w * h;
     const double bpp = k * 8 / (double)wh;
     const double percent = 100.0 * k / wh;
-    const char* file = strrchr(fn, '/');
-    if (file == null) { file = fn; } else { file++; }
     if (lossy == 0) {
         printf("%s %dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s\n",
-                file, w, h, wh, bytes, bpp, percent, '%', lossy, rle ? " RLE" : "");
+                file, w, h, wh, k, bpp, percent, '%', lossy, rle ? " RLE" : "");
     } else {
         printf("%s %dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s rms(err) = %.1f%c\n",
-                file, w, h, wh, bytes, bpp, percent, '%', lossy, rle ? " RLE" : "",
+                file, w, h, wh, k, bpp, percent, '%', lossy, rle ? " RLE" : "",
                 rms(decoded, copy, n) * 100, '%');
     }
     free(copy);
@@ -569,11 +575,11 @@ static void compress_folder(const char* folder_name) {
         const char* suffix = "";
         if (folder_is_folder(folders, i)) { suffix = "/"; }
         if (folder_is_symlink(folders, i)) { suffix = "->"; }
-        printf("%s%s\n", pathname, suffix);
-        image_compress(pathname, false, 0, false);
-        image_compress(pathname, true,  0, false);
-        image_compress(pathname, false, 1, false);
-        image_compress(pathname, true,  1, false);
+//      printf("%s%s\n", pathname, suffix);
+        image_compress(pathname, false, 0, true);
+        image_compress(pathname, true,  0, true);
+        image_compress(pathname, false, 1, true);
+        image_compress(pathname, true,  1, true);
         free(pathname);
     }
     folder_close(folders);
@@ -608,6 +614,7 @@ int main(int argc, const char* argv[]) {
     setbuf(stdout, null);
     argc = option_bool(argc, argv, "-o", &option_output);
     argc = option_int(argc, argv, "-n=%d", &option_lossy);
+    argc = option_int(argc, argv, "-t=%d", &option_threshold);
     delta_modulo_folding(1, false);
 //  delta_modulo_folding(63, true);
     d8x4_test(true, 1);  // with RLE lossy
