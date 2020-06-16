@@ -5,6 +5,8 @@ VisualStudioVersion = 15.0.28307.1145
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "loco", "loco.vcxproj", "{D156E706-727B-45FC-8565-AA0AB6AE1379}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "l0c0", "l0c0.vcxproj", "{1111BA8E-BE4C-422C-819D-AEF4E8AEBAFB}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -27,6 +29,18 @@ Global
 		{D156E706-727B-45FC-8565-AA0AB6AE1379}.Release|x64.Build.0 = Release|x64
 		{D156E706-727B-45FC-8565-AA0AB6AE1379}.Release|x86.ActiveCfg = Release|Win32
 		{D156E706-727B-45FC-8565-AA0AB6AE1379}.Release|x86.Build.0 = Release|Win32
+		{1111BA8E-BE4C-422C-819D-AEF4E8AEBAFB}.Debug|x64.ActiveCfg = Debug|x64
+		{1111BA8E-BE4C-422C-819D-AEF4E8AEBAFB}.Debug|x64.Build.0 = Debug|x64
+		{1111BA8E-BE4C-422C-819D-AEF4E8AEBAFB}.Debug|x86.ActiveCfg = Debug|Win32
+		{1111BA8E-BE4C-422C-819D-AEF4E8AEBAFB}.Debug|x86.Build.0 = Debug|Win32
+		{1111BA8E-BE4C-422C-819D-AEF4E8AEBAFB}.Hybrid|x64.ActiveCfg = Hybrid|x64
+		{1111BA8E-BE4C-422C-819D-AEF4E8AEBAFB}.Hybrid|x64.Build.0 = Hybrid|x64
+		{1111BA8E-BE4C-422C-819D-AEF4E8AEBAFB}.Hybrid|x86.ActiveCfg = Hybrid|Win32
+		{1111BA8E-BE4C-422C-819D-AEF4E8AEBAFB}.Hybrid|x86.Build.0 = Hybrid|Win32
+		{1111BA8E-BE4C-422C-819D-AEF4E8AEBAFB}.Release|x64.ActiveCfg = Release|x64
+		{1111BA8E-BE4C-422C-819D-AEF4E8AEBAFB}.Release|x64.Build.0 = Release|x64
+		{1111BA8E-BE4C-422C-819D-AEF4E8AEBAFB}.Release|x86.ActiveCfg = Release|Win32
+		{1111BA8E-BE4C-422C-819D-AEF4E8AEBAFB}.Release|x86.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

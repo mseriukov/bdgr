@@ -16,6 +16,14 @@
 #include <assert.h>
 #include <errno.h>
 #include <folders.h>
+#ifdef WIN32
+#if !defined(STRICT)
+#define STRICT
+#endif
+#define WIN32_LEAN_AND_MEAN
+#define VC_EXTRALEAN
+#include <Windows.h>
+#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -25,6 +33,7 @@
 #ifdef _MSC_VER // 1200, 1300, ...
 #pragma warning(disable: 4189) // local variable is initialized but not referenced
 #pragma warning(disable: 4505) // unreferenced local function has been removed
+#pragma warning(disable: 4127) // conditional expression is constant
 #endif
 
 #define null NULL // beautification of code
@@ -83,83 +92,175 @@ static double rms(byte* a, byte* b, int n) {
     return sqrt(s) / n;
 }
 
-static int push_bits(byte* output, int bytes, int pos, int v, int bits) {
-    assert(0 <= v);
-    assert(bits <= 31);
-    for (int i = 0; i < bits; i++) {
-        const int bit_pos = (pos + i) % 8;
-        const int byte_pos = (pos + i) / 8;
-        assert(0 <= byte_pos && byte_pos < bytes);
-        const byte b = output[(pos + i) / 8];
-        const int bv = ((1 << i) & v) != 0; // bit value
-        // clear bit at bit_pos and set it to the bit value:
-        output[byte_pos] = (byte)((b & ~(1 << bit_pos)) | (bv << bit_pos));
+static int64_t freq = 0;
+
+static double time_in_seconds() {
+    LARGE_INTEGER li;
+    QueryPerformanceCounter(&li);
+    if (freq == 0) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = f.QuadPart;
     }
-    return pos + bits;
+    return (double)li.QuadPart / freq;
 }
 
-static int pull_bits(byte* input, int bytes, int* bp, int bits) {
-    assert(bits < 31);
-    int pos = *bp;
-    int v = 0;
-    for (int i = 0; i < bits; i++) {
-        const int bit_pos = (pos + i) % 8;
-        const int byte_pos = (pos + i) / 8;
-        assert(0 <= byte_pos && byte_pos < bytes);
-        const byte bv = (input[byte_pos] & (1 << bit_pos)) != 0; // bit value
-        v |= (bv << i);
+typedef struct bitio_s bitio_t;
+
+typedef struct bitio_s {
+    uint64_t  bits;
+    uint64_t* p; // pointer inside data
+    int count;   // number of bits in `bits'
+    int bytes;
+    byte data[4 * 1024];
+    int (*read)(bitio_t* bitio, int bytes); // returns 0 or errno, reads `bytes' or less of `data'
+    int (*write)(bitio_t* bitio, int bytes); // returns 0 or errno, write `bytes' of `data'
+    int written;
+    void* that;
+} bitio_t;
+
+enum {
+    BYTES = (int)sizeof(((bitio_t*)null)->bits),
+    BITS  = BYTES * 8
+};
+
+static void bitio_read(bitio_t* bio) { // must be called once on init
+    int r = bio->read(bio, (int)sizeof(bio->data));
+    assert(r == 0 && bio->bytes > 0);
+    bio->p = (uint64_t*)bio->data;
+    bio->bits = *bio->p; // read 8 bytes of data
+    int k = minimum(bio->bytes, BYTES);
+    bio->count  = k * 8;
+    bio->bytes -= k;
+    bio->p++;
+}
+
+static void bitio_read_init(bitio_t* bio) { bitio_read(bio); } // must be called once on init
+
+int pos;
+
+static inline int bitio_read_1_bit(bitio_t* bio) {
+    if (bio->count == 0) {
+        if (bio->bytes > 0) {
+            bio->bits = *bio->p;
+            bio->p++;
+            int k = minimum(BYTES, bio->bytes);
+            bio->bytes -= k;
+            bio->count = k * 8;
+        } else {
+            bitio_read(bio);
+        }
     }
-printf("@%d,%d=%d\n", pos, bits, v); \
-    *bp = pos + bits;
+    int v = bio->bits & 0x1; bio->count--; bio->bits >>= 1;
+//printf("@%d,%d=%d\n", pos, 1, v);
+    pos++;
     return v;
 }
 
+static inline int bitio_read_n_bits(bitio_t* bio, int n) {
+    assert(0 <= n && n < 32);
+int at = pos;
+    int v = 0;
+    for (int i = n; i > 0; i--) { v = (v << 1) | bitio_read_1_bit(bio); }
+//printf("@%d,%d=%d\n", at, n, v);
+    return v;
+}
 
-static int encode_unary(byte* output, int count, int pos, int q) { // encode q as unary
+static void bitio_write_init(bitio_t* bio) { // must be called once on init
+    bio->p = (uint64_t*)bio->data;
+    bio->bits  = 0;
+    bio->count = 0;
+    bio->bytes = 0;
+}
+
+static void bitio_flush(bitio_t* bio) {
+    if (bio->count > 0) {
+        int k = (bio->count + 7) / 8;
+        *bio->p = bio->bits;
+        bio->bytes += k;
+        assert(bio->bytes <= sizeof(bio->data));
+        int r = bio->write(bio, bio->bytes);
+        assert(r == 0);
+        bio->written += bio->bytes;
+        bio->bytes = 0;
+    }
+}
+
+static inline void bitio_write_1_bit(bitio_t* bio, int v) {
+    assert(0 <= v && v <= 1);
+    assert(bio->count < BITS);
+    if (v != 0) { bio->bits |= ((uint64_t)v) << bio->count; }
+    bio->count++;
+    if (bio->count == BITS) {
+        *bio->p = (bio)->bits; (bio)->p++;
+        bio->bytes += BYTES;
+        bio->count = 0;
+        bio->bits = 0;
+        if (bio->bytes == (int)sizeof(bio->data)) {
+            int r = bio->write(bio, bio->bytes);
+            assert(r == 0);
+            bio->written += bio->bytes;
+            bio->bytes = 0;
+            bio->p = (uint64_t*)bio->data;
+        }
+    }
+}
+
+static inline void bitio_write_n_bits(bitio_t* bio, int v, int n) {
+    assert(0 <= (v) && (v) <= (1 << (n)) - 1);
+    assert(0 <= (n) && (n) < 32);
+    while (n > 0) {
+        n--;
+        bitio_write_1_bit(bio, (v >> n) & 1);
+    }
+}
+
+static inline void encode_unary(bitio_t* bio, int q) { // encode q as unary
     if (q >= limit) { // 24 bits versus possible 511 bits is a win? TODO: verify
         assert(q <= 0xFF);
         assert(limit <= 31);
-        pos = push_bits(output, count, pos, 0x7FFFFFFF, limit);
-        pos = push_bits(output, count, pos, 0, 1);
-        pos = push_bits(output, count, pos, q, 8);
+        enum { mask = (1 << limit) - 1 };
+        bitio_write_n_bits(bio, mask, limit);
+        bitio_write_1_bit(bio, 0);
+        bitio_write_n_bits(bio, q, 8);
     } else {
-        while (q > 0) { pos = push_bits(output, count, pos, 1, 1); q--; }
-        pos = push_bits(output, count, pos, 0, 1);
+        const int mask = (1 << q) - 1;
+        bitio_write_n_bits(bio, mask, q);
+        bitio_write_1_bit(bio, 0);
     }
-    return pos;
 }
 
-static int encode_entropy(byte* output, int count, int pos, int v, int bits) {
+static inline void encode_entropy(bitio_t* bio, int v, int bits) {
     // simple entropy encoding https://en.wikipedia.org/wiki/Golomb_coding for now
     // can be improved to https://en.wikipedia.org/wiki/Asymmetric_numeral_systems
     assert(0 <= v && v <= 0xFF);
     const int m = 1 << bits;
     int q = v >> bits; // v / m quotient
-    pos = encode_unary(output, count, pos, q);
+    encode_unary(bio, q);
     const int r = v & (m - 1); // v % m reminder (bits)
-    pos = push_bits(output, count, pos, r, bits);
-    return pos;
+    bitio_write_n_bits(bio, r, bits);
 }
 
-static int decode_unary(byte* input, int bytes, int* pos) {
+static int decode_unary(bitio_t* bio) {
     int q = 0;
     for (;;) {
-        int bit = pull_bits(input, bytes, pos, 1);
+        int bit = bitio_read_1_bit(bio);
         if (bit == 0) { break; }
         q++;
     }
     assert(q <= limit);
     if (q == limit) {
-        return pull_bits(input, bytes, pos, 8);
+        int v = bitio_read_n_bits(bio, 8);
+        return v;
     } else {
         return q;
     }
 }
 
-static int decode_entropy(byte* input, int bytes, int* pos, int bits) {
-    int q = decode_unary(input, bytes, pos);
-    int r = pull_bits(input, bytes, pos, bits);
-    int v = (q << bits) | r;
+static int decode_entropy(bitio_t* bio, int n) {
+    int q = decode_unary(bio);
+    int r = bitio_read_n_bits(bio, n);
+    int v = (q << n) | r;
     return v;
 }
 
@@ -186,19 +287,19 @@ typedef struct encoder_context_s {
     int h;
     bool  rle;
     byte* data;
-    byte* output;
-    int   max_bytes; // number of bytes available in output
+    // predictor:
     byte* prev; // previous line or null for y == 0
     byte* line; // current line
     int   bits; // bit-width of Golomb entropy encoding
     int   last; // last pixel value
     int   lossy;
     int   lossy2p1; // lossy * 2 + 1
-    int   pos; // output bit position
     int   x;
     int   y;
     int   v; // current pixel value at [x,y]
     neighbors_t neighbors;
+    // output:
+    bitio_t bio;
 } encoder_context_t;
 
 static int prediction(int x, int y, int a, int b, int c) {
@@ -235,21 +336,20 @@ static void encode_delta(encoder_context_t* context, int v);
 static void encode_run(encoder_context_t* context, int count) {
     #define ctx (*context)
     if (count == 1) { // run == 1 encoded 2 bits as 0xb10
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1);
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 0, 1);
+        bitio_write_1_bit(&ctx.bio, 1);
+        bitio_write_1_bit(&ctx.bio, 0);
     } else if (count <= 5) {
         count -= 2; // 1 already encoded above 2 -> 0, 3 -> 1, 4 -> 2, 5 -> 3
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1);
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1);
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 0, 1);
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, count, 2);
+        enum { b110 = 6 }; // Microsoft compiler does not understand: 0b110
+        bitio_write_n_bits(&ctx.bio, b110, 3);
+        bitio_write_n_bits(&ctx.bio, count, 2);
         // 5 bits 0xb110cc
     } else {
         count -= 6;
         int lb = log2n(count); assert(lb + 2 >= 3);
 //      printf("@%d unary(%d) and %d bits of %d=0b%s\n", ctx.pos, lb + 2, lb, count, b2s(count, lb));
-        ctx.pos = encode_unary(ctx.output, ctx.max_bytes, ctx.pos, lb + 2);
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, count, lb);
+        encode_unary(&ctx.bio, lb + 2);
+        bitio_write_n_bits(&ctx.bio, count, lb);
         // count 6 -> 0, 7 -> 1                     log2(count) == 1
         //       8 -> 2, 9 -> 3,                    log2(count) == 2
         //      10 -> 4, 11 -> 5, 12 -> 6, 13 -> 7  log2(count) == 3
@@ -273,7 +373,7 @@ static void encode_rle(encoder_context_t* context) {
         encode_run(context, count);
         ctx.x--; // will be incremented by for(x) loop
     } else {
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes,ctx.pos, 0, 1);
+        bitio_write_1_bit(&ctx.bio, 0);
         encode_delta(context, ctx.line[ctx.x]);
     }
     #undef ctx
@@ -284,8 +384,6 @@ static inline bool rle_mode(neighbors_t* neighbors, int lossy) {
     return abs(ns.d1) <= lossy && abs(ns.d2) <= lossy && abs(ns.d3) <= lossy;
     #undef ns
 }
-
-static int verify[1024][1024];
 
 static void encode_delta(encoder_context_t* context, int v) {
     #define ctx (*context)
@@ -312,14 +410,11 @@ static void encode_delta(encoder_context_t* context, int v) {
     // negative:  255      3   1
     int rice = delta >= 0 ? delta * 2 : -delta * 2 - 1;
     assert(0 <= rice && rice <= 0xFF);
-    int at = ctx.pos;
-verify[ctx.x][ctx.y] = at;
-    ctx.pos = encode_entropy(ctx.output, ctx.max_bytes, ctx.pos, rice, ctx.bits);
+    encode_entropy(&ctx.bio, rice, ctx.bits);
 //  printf("[%3d,%-3d] predicted=%3d v=%3d rice=%4d delta=%4d bits=%d @%d\n",
 //         ctx.x, ctx.y, predicted, ctx.v, rice, delta, ctx.bits, at);
     ctx.bits = 0;
     while ((1 << ctx.bits) < rice) { ctx.bits++; }
-//if (ctx.bits > 1 ) { ctx.bits = log2n(rice); }
     ctx.last = ctx.v;
     #undef ctx
 }
@@ -333,6 +428,7 @@ static int encode_context(encoder_context_t* context) {
             if (ctx.rle && ctx.last >= 0 && rle_mode(&ctx.neighbors, ctx.lossy)) {
                 encode_rle(context);
             } else {
+//if (ctx.x == 7 && ctx.y == 3) { __debugbreak(); }
                 encode_delta(context, ctx.line[ctx.x]);
             }
         }
@@ -341,11 +437,26 @@ static int encode_context(encoder_context_t* context) {
         ctx.last = -1;
         ctx.bits = start_with_bits;
     }
-    return (ctx.pos + 7) / 8;
+    bitio_flush(&ctx.bio);
+    return ctx.bio.written;
     #undef ctx
 }
 
-int encode(byte* data, int w, int h, bool rle, int lossy, byte* output, int max_bytes) {
+typedef struct reader_s {
+    byte* data;
+    int bytes;
+    int pos;
+    int (*read)(bitio_t* bio, int n);
+} reader_t;
+
+typedef struct writer_s {
+    byte* data;
+    int bytes;
+    int pos;
+    int (*write)(bitio_t* bio, int n);
+} writer_t;
+
+int encode(byte* data, int w, int h, bool rle, int lossy, writer_t* writer) {
     assert(lossy >= 0);
     encoder_context_t ctx = {};
     ctx.rle = rle;
@@ -354,45 +465,54 @@ int encode(byte* data, int w, int h, bool rle, int lossy, byte* output, int max_
     ctx.data = data;
     ctx.w = w;
     ctx.h = h;
-    ctx.output = output;
-    ctx.max_bytes = max_bytes;
+    bitio_write_init(&ctx.bio);
+    ctx.bio.that = writer;
+    ctx.bio.write = writer->write;
     ctx.last = -1;
     ctx.bits = start_with_bits; // m = (1 << bits)
     ctx.line = data;
     // shared knowledge between encoder and decoder:
     // does not have to be encoded in the stream, may as well be simply known by both
-    ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, w, 16);
-    ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, h, 16);
-    ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, lossy, 8);
+    bitio_write_n_bits(&ctx.bio, w, 16);
+    bitio_write_n_bits(&ctx.bio, h, 16);
+    bitio_write_n_bits(&ctx.bio, lossy, 8);
     return encode_context(&ctx);
 }
 
-static int decode_run(byte* input, int bytes, int *pos) { // return run count
-    int bit = pull_bits(input, bytes, pos, 1);
+static int decode_run(bitio_t* bio) { // returns run count
+    int bit = bitio_read_1_bit(bio);
     if (bit == 0) { return 1; }
-    bit = pull_bits(input, bytes, pos, 1);
+    bit = bitio_read_1_bit(bio);
     if (bit == 0) {
-        return pull_bits(input, bytes, pos, 2) + 2;
+        int count = bitio_read_n_bits(bio, 2);
+        return count + 2;
     } else {
         int lb = 3;
         for (;;) {
-            if (pull_bits(input, bytes, pos, 1) == 0) { break; }
+            bit = bitio_read_1_bit(bio);
+            if (bit == 0) { break; }
             lb++;
         }
         assert(lb >= 3);
-        return pull_bits(input, bytes, pos, lb - 2) + 6;
+        int count = bitio_read_n_bits(bio, lb - 2);
+        return count + 6;
     }
 }
 
-int decode(byte* input, int bytes, bool rle, byte* output, int width, int height, int loss) {
+int decode(reader_t* reader, bool rle, byte* output, int width, int height, int loss) {
+    (void)width; (void)height; (void)loss;
+    bitio_t bitio = {};
+    bitio.that = reader;
+    bitio.read = reader->read;
+    bitio_t* bio = &bitio;
+    bitio_read_init(bio);
     byte* prev = null;
     byte* line = output;
-    int pos = 0; // input bit position
     int bits  = start_with_bits;
     int last = -1;
-    const int w = pull_bits(input, bytes, &pos, 16);
-    const int h = pull_bits(input, bytes, &pos, 16);
-    const int lossy = pull_bits(input, bytes, &pos, 8);
+    int w = bitio_read_n_bits(bio, 16);
+    int h = bitio_read_n_bits(bio, 16);
+    int lossy = bitio_read_n_bits(bio, 8);
     const int lossy2p1 = lossy * 2 + 1;
     assert(w == width && h == height && lossy == loss);
     for (int y = 0; y < h; y++) {
@@ -401,21 +521,20 @@ int decode(byte* input, int bytes, bool rle, byte* output, int width, int height
             neighbors(x, y, w, prev, line, &nei);
             bool run_mode = rle && last >= 0 && rle_mode(&nei, lossy);
             if (run_mode) {
-                run_mode = pull_bits(input, bytes, &pos, 1) != 0;
+                run_mode = bitio_read_1_bit(bio);
             }
             if (run_mode) {
-                int count = decode_run(input, bytes, &pos);
+                int count = decode_run(bio);
 //              printf("decode rle run count=%d @%d [%d,%d] last=%d\n", count, pos, x + count, y, last);
                 while (count > 0) { line[x] = (byte)last; x++; count--; }
                 assert(x <= w);
                 x--; // because it will be incremented by for loop above
             } else {
-if (x == 6 && y == 3) { __debugbreak(); }
+//if (x == 7 && y == 3) { __debugbreak(); }
                 int predicted = prediction(x, y, nei.a, nei.b, nei.c);
-                int at = pos; // only for printf below
-                int rice = decode_entropy(input, bytes, &pos, bits);
-printf("[%d,%d] %d rice=%d bits=%d predicted=%d\n", x, y, pos, rice, bits, predicted);
+                int rice = decode_entropy(bio, bits);
                 assert(0 <= rice && rice <= 0xFF);
+//printf("[%d,%d] %d rice=%d bits=%d predicted=%d\n", x, y, pos, rice, bits, predicted);
                 int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
                 if (lossy > 0) {
                     delta *= lossy2p1;
@@ -426,10 +545,8 @@ printf("[%d,%d] %d rice=%d bits=%d predicted=%d\n", x, y, pos, rice, bits, predi
                 last = v;
 //              printf("[%3d,%-3d] predicted=%3d v=%3d rice=%4d delta=%4d bits=%d @%d\n",
 //                      x, y, predicted, v, rice, delta, bits, at);
-assert(at == verify[x][y]);
                 bits = 0;
                 while ((1 << bits) < rice) { bits++; }
-//if (bits > 1) { bits = log2n(rice); }
             }
         }
         last = -1;
@@ -438,6 +555,24 @@ assert(at == verify[x][y]);
         bits = start_with_bits;
     }
     return w * h;
+}
+
+static int reader_read(bitio_t* bio, int n) {
+    reader_t* rd = (reader_t*)bio->that;
+    int k = minimum(n, rd->bytes - rd->pos);
+    assert(k > 0);
+    memcpy(bio->data, rd->data + rd->pos, k);
+    rd->pos += k;
+    bio->bytes = k;
+    return 0;
+}
+
+static int writer_write(bitio_t* bio, int n) {
+    writer_t* wr = (writer_t*)bio->that;
+    assert(wr->pos + n <= wr->bytes);
+    memcpy(wr->data + wr->pos, bio->data, n);
+    wr->pos += n;
+    return 0;
 }
 
 static void d8x4_test(bool rle, int lossy) {
@@ -459,10 +594,25 @@ static void d8x4_test(bool rle, int lossy) {
     byte copy[bytes];
     memcpy(copy, data, bytes);
     byte encoded[countof(data) * 2] = {};
-    int k = encode(data, w, h, rle, lossy, encoded, countof(encoded));
-hexdump(encoded, k);
+
+    writer_t writer = {};
+    writer.data = encoded;
+    writer.bytes = countof(encoded);
+    writer.write = writer_write;
+
+    double encode_time = time_in_seconds();
+    int k = encode(data, w, h, rle, lossy, &writer);
+    encode_time = time_in_seconds() - encode_time;
+
+    reader_t reader = {};
+    reader.data = encoded;
+    reader.bytes = k;
+    reader.read = reader_read;
+
     byte decoded[countof(data)] = {};
-    int n = decode(encoded, k, rle, decoded, w, h, lossy);
+    double decode_time = time_in_seconds();
+    int n = decode(&reader, rle, decoded, w, h, lossy);
+    decode_time = time_in_seconds() - decode_time;
     assert(n == countof(data));
     if (lossy == 0) {
         assert(memcmp(decoded, data, n) == 0);
@@ -472,8 +622,9 @@ hexdump(encoded, k);
     const int wh = w * h;
     const double bpp = k * 8 / (double)wh;
     const double percent = 100.0 * k / wh;
-    printf("%dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s\n",
-            w, h, wh, k, bpp, percent, '%', lossy, rle ? " RLE" : "");
+    printf("%dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d) %s encode %.3fms decode %.3fms\n",
+            w, h, wh, k, bpp, percent, '%', lossy, rle ? " RLE" : "",
+            encode_time * 1000, decode_time * 1000);
 }
 
 static bool option_output;
@@ -481,6 +632,7 @@ static int  option_lossy;
 static int  option_threshold;
 
 static void image_compress(const char* fn, bool rle, int lossy, bool write) {
+    (void)fn; (void)rle; (void)lossy; (void)write;
     int w = 0;
     int h = 0;
     int c = 0;
@@ -497,8 +649,25 @@ static void image_compress(const char* fn, bool rle, int lossy, bool write) {
     byte* decoded = (byte*)malloc(bytes);
     byte* copy    = (byte*)malloc(bytes);
     memcpy(copy, data, bytes);
-    int k = encode(data, w, h, rle, lossy, encoded, bytes * 3);
-    int n = decode(encoded, k, rle, decoded, w, h, lossy);
+
+    writer_t writer = {};
+    writer.data = encoded;
+    writer.bytes = bytes * 3;
+    writer.write = writer_write;
+
+    double encode_time = time_in_seconds();
+    int k = encode(data, w, h, rle, lossy, &writer);
+    encode_time = time_in_seconds() - encode_time;
+
+    reader_t reader = {};
+    reader.data = encoded;
+    reader.bytes = k;
+    reader.read = reader_read;
+
+    double decode_time = time_in_seconds();
+    int n = decode(&reader, rle, decoded, w, h, lossy);
+    decode_time = time_in_seconds() - decode_time;
+
     assert(n == bytes);
     if (lossy == 0) {
         assert(memcmp(decoded, copy, n) == 0);
@@ -520,43 +689,19 @@ static void image_compress(const char* fn, bool rle, int lossy, bool write) {
     const double bpp = k * 8 / (double)wh;
     const double percent = 100.0 * k / wh;
     if (lossy == 0) {
-        printf("%s %dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s\n",
-                file, w, h, wh, k, bpp, percent, '%', lossy, rle ? " RLE" : "");
-    } else {
-        printf("%s %dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s rms(err) = %.1f%c\n",
+        printf("%s %dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s encode %.3fms decode %.3fms\n",
                 file, w, h, wh, k, bpp, percent, '%', lossy, rle ? " RLE" : "",
-                rms(decoded, copy, n) * 100, '%');
+               encode_time * 1000, decode_time * 1000);
+    } else {
+        printf("%s %dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s rms(err) = %.1f%c encode %.3fms decode %.3fms\n",
+                file, w, h, wh, k, bpp, percent, '%', lossy, rle ? " RLE" : "",
+                rms(decoded, copy, n) * 100, '%',
+                encode_time * 1000, decode_time * 1000);
     }
     free(copy);
     free(encoded);
     free(decoded);
     stbi_image_free(data);
-}
-
-static void delta_modulo_folding(int step, bool verbose) {
-    for (int p = 0; p <= 0xFF; p += step) {
-        for (int v = 0; v <= 0xFF; v += step) {
-            int d1 = p - v;
-            assert(-255 <= d1 && d1 <= +255);
-            // because: for any byte x (x + delta) == (x + delta + 256)
-            assert((byte)v == (byte)(p - d1));
-            int d2 = d1 < 0 ? d1 + 256 : d1;
-            int d3 = d2 >= 128 ? d2 - 256 : d2;
-            // this folds abs(deltas) > 128 to much smaller numbers which is OK
-            assert(-128 <= d3 && d3 <= 127);
-            int rice = d3 >= 0 ? d3 * 2 : -d3 * 2 - 1;
-            int log2 = 0;
-            while ((1 << log2) < rice) { log2++; }
-            int ice = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
-            assert(ice == d3);
-            int x = (byte)(p - ice);
-            if (verbose) {
-                printf("p=%4d v=%4d d1=%4d d2=%4d d3=%4d rice=%4d log2=%d x=%4d\n",
-                        p, v, d1, d2, d3, rice, log2, x);
-            }
-            assert(x == v);
-        }
-    }
 }
 
 static void straighten(char* pathname) {
@@ -580,10 +725,10 @@ static void compress_folder(const char* folder_name) {
         if (folder_is_folder(folders, i)) { suffix = "/"; }
         if (folder_is_symlink(folders, i)) { suffix = "->"; }
 //      printf("%s%s\n", pathname, suffix);
-        image_compress(pathname, false, 0, true);
-        image_compress(pathname, true,  0, true);
-        image_compress(pathname, false, 1, true);
-        image_compress(pathname, true,  1, true);
+        image_compress(pathname, false, 0, option_output);
+        image_compress(pathname, true,  0, option_output);
+        image_compress(pathname, false, 1, option_output);
+        image_compress(pathname, true,  1, option_output);
         free(pathname);
     }
     folder_close(folders);
@@ -619,8 +764,10 @@ int main(int argc, const char* argv[]) {
     argc = option_bool(argc, argv, "-o", &option_output);
     argc = option_int(argc, argv, "-n=%d", &option_lossy);
     argc = option_int(argc, argv, "-t=%d", &option_threshold);
-    delta_modulo_folding(1, false);
-//  delta_modulo_folding(63, true);
+    image_compress("L_6.png", false,  0, option_output);
+    image_compress("L_6.png", false,  1, option_output);
+    image_compress("L_6.png", true,  1, option_output);
+if (1) return 0;
     d8x4_test(false, 0); // w/o RLE
     d8x4_test(true, 0);  // with RLE lossless
     d8x4_test(true, 1);  // with RLE lossy
@@ -634,9 +781,14 @@ int main(int argc, const char* argv[]) {
     image_compress("greyscale.640x480.pgm", true,  2, option_output);
     image_compress("greyscale.640x480.pgm", true,  3, option_output);
     image_compress("greyscale.640x480.pgm", true,  4, option_output);
+    image_compress("thermo-foil.png", false, 0, option_output);
+    image_compress("thermo-foil.png", false, 1, option_output);
     image_compress("thermo-foil.png", true, 1, option_output);
-    if (argc > 1 && is_folder(argv[1])) {
+
+    while (argc > 1 && is_folder(argv[1])) {
         compress_folder(argv[1]);
+        memmove(&argv[1], &argv[2], (argc - 2) * sizeof(argv[1]));
+        argc--;
     }
     return 0;
 }
