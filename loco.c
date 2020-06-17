@@ -38,7 +38,7 @@ extern "C" {
 #endif
 
 enum {
-    limit = 15, // unary encoding bit limit
+    limit = 6, // unary encoding bit limit (6 is optimal for thermofoil)
     start_with_bits = 3 // must be the same in encode and decode
 };
 
@@ -109,17 +109,16 @@ static int pull_bits(byte* input, int bytes, int* bp, int bits) {
         const byte bv = (input[byte_pos] & (1 << bit_pos)) != 0; // bit value
         v |= (bv << i);
     }
-printf("@%d,%d=%d\n", pos, bits, v); \
+// printf("@%d,%d=%d\n", pos, bits, v);
     *bp = pos + bits;
     return v;
 }
-
 
 static int encode_unary(byte* output, int count, int pos, int q) { // encode q as unary
     if (q >= limit) { // 24 bits versus possible 511 bits is a win? TODO: verify
         assert(q <= 0xFF);
         assert(limit <= 31);
-        pos = push_bits(output, count, pos, 0x7FFFFFFF, limit);
+        pos = push_bits(output, count, pos, (1 << limit) - 1, limit);
         pos = push_bits(output, count, pos, 0, 1);
         pos = push_bits(output, count, pos, q, 8);
     } else {
@@ -129,15 +128,24 @@ static int encode_unary(byte* output, int count, int pos, int q) { // encode q a
     return pos;
 }
 
+static int bits_freq[128];
+static int quo_freq[256];
+
 static int encode_entropy(byte* output, int count, int pos, int v, int bits) {
     // simple entropy encoding https://en.wikipedia.org/wiki/Golomb_coding for now
     // can be improved to https://en.wikipedia.org/wiki/Asymmetric_numeral_systems
     assert(0 <= v && v <= 0xFF);
     const int m = 1 << bits;
     int q = v >> bits; // v / m quotient
+int at = pos;
+quo_freq[q]++;
     pos = encode_unary(output, count, pos, q);
     const int r = v & (m - 1); // v % m reminder (bits)
     pos = push_bits(output, count, pos, r, bits);
+bits_freq[pos - at]++;
+if (pos - at == 1) { assert(bits == 0 && v == 0); }
+if (pos - at == 2 && v > 1) { printf("v=%d bits=%d\n", v, bits); }
+if (pos - at == 3 && v > 3) { printf("v=%d bits=%d\n", v, bits); }
     return pos;
 }
 
@@ -239,16 +247,20 @@ static void encode_run(encoder_context_t* context, int count) {
         ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 0, 1);
     } else if (count <= 5) {
         count -= 2; // 1 already encoded above 2 -> 0, 3 -> 1, 4 -> 2, 5 -> 3
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1);
+        assert(limit > 3);
+        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1); // unary(3)
         ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1);
         ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 0, 1);
         ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, count, 2);
         // 5 bits 0xb110cc
     } else {
         count -= 6;
-        int lb = log2n(count); assert(lb + 2 >= 3);
+        int lb = log2n(count);
 //      printf("@%d unary(%d) and %d bits of %d=0b%s\n", ctx.pos, lb + 2, lb, count, b2s(count, lb));
-        ctx.pos = encode_unary(ctx.output, ctx.max_bytes, ctx.pos, lb + 2);
+        // deliberately not using encode_unary here because limit may be < lb
+        // need to add 2x"1" before unary lb (see above)
+        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, (1 << (lb + 2)) - 1, (lb + 2));
+        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 0, 1);
         ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, count, lb);
         // count 6 -> 0, 7 -> 1                     log2(count) == 1
         //       8 -> 2, 9 -> 3,                    log2(count) == 2
@@ -313,7 +325,8 @@ static void encode_delta(encoder_context_t* context, int v) {
     int rice = delta >= 0 ? delta * 2 : -delta * 2 - 1;
     assert(0 <= rice && rice <= 0xFF);
     int at = ctx.pos;
-verify[ctx.x][ctx.y] = at;
+verify[ctx.y][ctx.x] = at;
+//if (ctx.y <= 2 && ctx.x < 20) { printf("verify[%d][%d]=%d\n", ctx.y, ctx.x, verify[ctx.y][ctx.x]); }
     ctx.pos = encode_entropy(ctx.output, ctx.max_bytes, ctx.pos, rice, ctx.bits);
 //  printf("[%3d,%-3d] predicted=%3d v=%3d rice=%4d delta=%4d bits=%d @%d\n",
 //         ctx.x, ctx.y, predicted, ctx.v, rice, delta, ctx.bits, at);
@@ -368,19 +381,22 @@ int encode(byte* data, int w, int h, bool rle, int lossy, byte* output, int max_
 }
 
 static int decode_run(byte* input, int bytes, int *pos) { // return run count
+int at = *pos;
     int bit = pull_bits(input, bytes, pos, 1);
     if (bit == 0) { return 1; }
     bit = pull_bits(input, bytes, pos, 1);
     if (bit == 0) {
         return pull_bits(input, bytes, pos, 2) + 2;
     } else {
-        int lb = 3;
+        int lb = 3; // because we alread read two "1" "1" above
+        // deliberately not using decode_unary because limit may be < lb
         for (;;) {
             if (pull_bits(input, bytes, pos, 1) == 0) { break; }
             lb++;
         }
-        assert(lb >= 3);
-        return pull_bits(input, bytes, pos, lb - 2) + 6;
+        int count = pull_bits(input, bytes, pos, lb - 2) + 6;
+//      printf("@%d unary(%d) and %d bits of %d=0b%s\n", at, lb + 3, lb, count, b2s(count, lb));
+        return count;
     }
 }
 
@@ -410,11 +426,11 @@ int decode(byte* input, int bytes, bool rle, byte* output, int width, int height
                 assert(x <= w);
                 x--; // because it will be incremented by for loop above
             } else {
-if (x == 6 && y == 3) { __debugbreak(); }
+//if (x == 6 && y == 3) { __debugbreak(); }
                 int predicted = prediction(x, y, nei.a, nei.b, nei.c);
                 int at = pos; // only for printf below
                 int rice = decode_entropy(input, bytes, &pos, bits);
-printf("[%d,%d] %d rice=%d bits=%d predicted=%d\n", x, y, pos, rice, bits, predicted);
+//printf("[%d,%d] %d rice=%d bits=%d predicted=%d\n", x, y, pos, rice, bits, predicted);
                 assert(0 <= rice && rice <= 0xFF);
                 int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
                 if (lossy > 0) {
@@ -426,7 +442,7 @@ printf("[%d,%d] %d rice=%d bits=%d predicted=%d\n", x, y, pos, rice, bits, predi
                 last = v;
 //              printf("[%3d,%-3d] predicted=%3d v=%3d rice=%4d delta=%4d bits=%d @%d\n",
 //                      x, y, predicted, v, rice, delta, bits, at);
-assert(at == verify[x][y]);
+assert(at == verify[y][x]);
                 bits = 0;
                 while ((1 << bits) < rice) { bits++; }
 //if (bits > 1) { bits = log2n(rice); }
@@ -614,6 +630,13 @@ static int option_bool(int argc, const char* argv[], const char* opt, bool *b) {
     return argc;
 }
 
+static int sum(int a[], int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) { s += a[i]; }
+    return s;
+}
+
+
 int main(int argc, const char* argv[]) {
     setbuf(stdout, null);
     argc = option_bool(argc, argv, "-o", &option_output);
@@ -621,6 +644,20 @@ int main(int argc, const char* argv[]) {
     argc = option_int(argc, argv, "-t=%d", &option_threshold);
     delta_modulo_folding(1, false);
 //  delta_modulo_folding(63, true);
+    image_compress("thermo-foil.png", false, 0, option_output);
+    int bits_sum = sum(bits_freq, countof(bits_freq));
+    for (int i = 0; i < countof(bits_freq); i++) {
+        if (bits_freq[i] != 0) {
+            printf("%2d %d %.1f%%\n", i, bits_freq[i], sum(bits_freq, i + 1) * 100.0 / bits_sum);
+        }
+    }
+    printf("quontient:\n");
+    int quo_sum = sum(quo_freq, countof(quo_freq));
+    for (int i = 0; i < countof(quo_freq); i++) {
+        if (quo_freq[i] != 0) {
+            printf("%2d %d %.1f%%\n", i, quo_freq[i], sum(quo_freq, i + 1) * 100.0 / quo_sum);
+        }
+    }
     d8x4_test(false, 0); // w/o RLE
     d8x4_test(true, 0);  // with RLE lossless
     d8x4_test(true, 1);  // with RLE lossy
@@ -635,8 +672,10 @@ int main(int argc, const char* argv[]) {
     image_compress("greyscale.640x480.pgm", true,  3, option_output);
     image_compress("greyscale.640x480.pgm", true,  4, option_output);
     image_compress("thermo-foil.png", true, 1, option_output);
-    if (argc > 1 && is_folder(argv[1])) {
+    while (argc > 1 && is_folder(argv[1])) {
         compress_folder(argv[1]);
+        memmove(&argv[1], &argv[2], (argc - 2) * sizeof(argv[1]));
+        argc--;
     }
     return 0;
 }

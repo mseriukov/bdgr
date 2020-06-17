@@ -346,9 +346,11 @@ static void encode_run(encoder_context_t* context, int count) {
         // 5 bits 0xb110cc
     } else {
         count -= 6;
-        int lb = log2n(count); assert(lb + 2 >= 3);
+        int lb = log2n(count); assert(lb + 3 > 3);
 //      printf("@%d unary(%d) and %d bits of %d=0b%s\n", ctx.pos, lb + 2, lb, count, b2s(count, lb));
-        encode_unary(&ctx.bio, lb + 2);
+        // deliberately not using encode_unary here because limit may be < lb
+        // need to add 2x"1" before unary lb (see above)
+        bitio_write_n_bits(&ctx.bio, (1 << (lb + 2)) - 1, (lb + 2));
         bitio_write_n_bits(&ctx.bio, count, lb);
         // count 6 -> 0, 7 -> 1                     log2(count) == 1
         //       8 -> 2, 9 -> 3,                    log2(count) == 2
@@ -784,7 +786,6 @@ if (1) return 0;
     image_compress("thermo-foil.png", false, 0, option_output);
     image_compress("thermo-foil.png", false, 1, option_output);
     image_compress("thermo-foil.png", true, 1, option_output);
-
     while (argc > 1 && is_folder(argv[1])) {
         compress_folder(argv[1]);
         memmove(&argv[1], &argv[2], (argc - 2) * sizeof(argv[1]));
