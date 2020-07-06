@@ -15,7 +15,10 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
-#include <folders.h>
+
+#ifdef FOLDERS
+#include "folders.h"
+#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -128,6 +131,7 @@ static int encode_unary(byte* output, int count, int pos, int q) { // encode q a
     return pos;
 }
 
+static int k_freq[128];
 static int bits_freq[128];
 static int quo_freq[256];
 
@@ -136,6 +140,7 @@ static int encode_entropy(byte* output, int count, int pos, int v, int bits) {
     // can be improved to https://en.wikipedia.org/wiki/Asymmetric_numeral_systems
     assert(0 <= v && v <= 0xFF);
     const int m = 1 << bits;
+k_freq[bits]++;    
     int q = v >> bits; // v / m quotient
 int at = pos;
 quo_freq[q]++;
@@ -276,7 +281,7 @@ static void encode_run(encoder_context_t* context, int count) {
 static void encode_rle(encoder_context_t* context) {
     #define ctx (*context)
     int count = 0; // rle number of pixels in a run
-    while (abs(ctx.line[ctx.x] - ctx.last) <= ctx.lossy && ctx.x < ctx.w) {
+    while (ctx.x < ctx.w && abs(ctx.line[ctx.x] - ctx.last) <= ctx.lossy) {
         ctx.line[ctx.x] = (byte)ctx.last; // corrected value
         ctx.x++;
         count++;
@@ -579,6 +584,8 @@ static void straighten(char* pathname) {
     while (strchr(pathname, '\\') != null) { *strchr(pathname, '\\') = '/'; }
 }
 
+#ifdef FOLDERS
+
 static void compress_folder(const char* folder_name) {
     folder_t folders = folder_open();
     int r = folder_enumerate(folders, folder_name);
@@ -604,6 +611,8 @@ static void compress_folder(const char* folder_name) {
     }
     folder_close(folders);
 }
+
+#endif
 
 static int option_int(int argc, const char* argv[], const char* opt, int *n) {
     for (int i = 0; i < argc; i++) {
@@ -645,19 +654,31 @@ int main(int argc, const char* argv[]) {
     delta_modulo_folding(1, false);
 //  delta_modulo_folding(63, true);
     image_compress("thermo-foil.png", false, 0, option_output);
+
+    printf("k freq:\n");
+    int k_sum = sum(k_freq, countof(k_freq));
+    for (int i = 0; i < countof(k_freq); i++) {
+        if (k_freq[i] != 0) {
+            printf("%2d %7d %5.1f%% %5.1f%%\n", i, k_freq[i], k_freq[i] * 100.0 / k_sum, sum(k_freq, i + 1) * 100.0 / k_sum);
+        }
+    }
+
+    printf("bits per symbol:\n");
     int bits_sum = sum(bits_freq, countof(bits_freq));
     for (int i = 0; i < countof(bits_freq); i++) {
         if (bits_freq[i] != 0) {
-            printf("%2d %d %.1f%%\n", i, bits_freq[i], sum(bits_freq, i + 1) * 100.0 / bits_sum);
+            printf("%2d %7d %5.1f%% %5.1f%%\n", i, bits_freq[i], bits_freq[i] * 100.0 / bits_sum, sum(bits_freq, i + 1) * 100.0 / bits_sum);
         }
     }
+
     printf("quontient:\n");
     int quo_sum = sum(quo_freq, countof(quo_freq));
     for (int i = 0; i < countof(quo_freq); i++) {
         if (quo_freq[i] != 0) {
-            printf("%2d %d %.1f%%\n", i, quo_freq[i], sum(quo_freq, i + 1) * 100.0 / quo_sum);
+            printf("%2d %7d %5.1f%% %5.1f%%\n", i, quo_freq[i], quo_freq[i] * 100.0 / quo_sum, sum(quo_freq, i + 1) * 100.0 / quo_sum);
         }
     }
+if (1) exit(0);    
     d8x4_test(false, 0); // w/o RLE
     d8x4_test(true, 0);  // with RLE lossless
     d8x4_test(true, 1);  // with RLE lossy
@@ -672,11 +693,13 @@ int main(int argc, const char* argv[]) {
     image_compress("greyscale.640x480.pgm", true,  3, option_output);
     image_compress("greyscale.640x480.pgm", true,  4, option_output);
     image_compress("thermo-foil.png", true, 1, option_output);
+#ifdef FOLDERS
     while (argc > 1 && is_folder(argv[1])) {
         compress_folder(argv[1]);
         memmove(&argv[1], &argv[2], (argc - 2) * sizeof(argv[1]));
         argc--;
     }
+#endif    
     return 0;
 }
 
