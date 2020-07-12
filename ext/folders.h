@@ -14,9 +14,11 @@
 extern "C" {
 #endif
 
+#include <stdbool.h>
+
 typedef void* folder_t;
 
-bool is_folder(const char* pathname);
+int is_folder(const char* pathname); // != 0 when pathname is a folder otherwise 0 and errno
 
 folder_t folder_open();
 
@@ -32,11 +34,15 @@ bool folder_is_folder(folder_t dirs, int i);
 
 bool folder_is_symlink(folder_t dirs, int i);
 
+#ifdef WIN32 // only for Windows
+
 // functions folder_time_*() return time in absolute nanoseconds since start of OS epoch or 0 if failed or not available
 
 unsigned long long folder_time_created(folder_t dirs, int i);
 unsigned long long folder_time_updated(folder_t dirs, int i);
 unsigned long long folder_time_accessed(folder_t dirs, int i);
+
+#endif
 
 void folder_close(folder_t dirs);
 

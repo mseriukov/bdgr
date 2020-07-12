@@ -111,8 +111,7 @@ static int push_bits(byte* output, int bytes, int pos, int v, int bits) {
 void flush_bits(byte* output, int pos) {
     if (bits64 > 0) {
         r64 >>= 64 - bits64;
-//
-      printf("%016llX %d\n", r64, bits64);
+//      printf("%016llX %d\n", r64, bits64);
         int k = pos / 64;
         assert(memcmp(&r64, &output[k * 8], (bits64 + 7) / 8) == 0);
     }
@@ -453,7 +452,7 @@ static void image_compress(const char* fn, bool write) {
     const int wh = w * h;
     const double bpp = k * 8 / (double)wh;
     const double percent = 100.0 * k / wh;
-    printf("%s %dx%d %d->%d bytes %.3f bpp %.1f%c\n", file, w, h, wh, k, bpp, percent, '%');
+    printf("%s \t %dx%d %6d->%-6d bytes %.3f bpp %.1f%c\n", file, w, h, wh, k, bpp, percent, '%');
     free(copy);
     free(encoded);
     free(decoded);
