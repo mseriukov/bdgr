@@ -15,10 +15,10 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
-#ifdef FOLDERS
 #include "folders.h"
-#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -77,14 +77,9 @@ static void hexdump(byte* data, int bytes) {
     printf("\n");
 }
 
-static double rms(byte* a, byte* b, int n) {
-    double s = 0;
-    for (int i = 0; i < n; i++) {
-        double e = (double)a[i] - (double)b[i];
-        s += e * e;
-    }
-    return sqrt(s) / n;
-}
+
+static uint64_t r64;
+static int bits64;
 
 static int push_bits(byte* output, int bytes, int pos, int v, int bits) {
     assert(0 <= v);
@@ -98,7 +93,29 @@ static int push_bits(byte* output, int bytes, int pos, int v, int bits) {
         // clear bit at bit_pos and set it to the bit value:
         output[byte_pos] = (byte)((b & ~(1 << bit_pos)) | (bv << bit_pos));
     }
+    for (int i = 0; i < bits; i++) {
+        r64 = r64 >> 1;
+        const int bv = ((1 << i) & v) != 0; // bit value
+        if (bv != 0) { r64 |= (1UL << 63); }
+        bits64++;
+        if (bits64 == 64) {
+            int k = (pos + i) / 64;
+            assert(memcmp(&r64, &output[k * 8], 8) == 0);
+            bits64 = 0;
+            r64 = 0;
+        }
+    }
     return pos + bits;
+}
+
+void flush_bits(byte* output, int pos) {
+    if (bits64 > 0) {
+        r64 >>= 64 - bits64;
+//
+      printf("%016llX %d\n", r64, bits64);
+        int k = pos / 64;
+        assert(memcmp(&r64, &output[k * 8], (bits64 + 7) / 8) == 0);
+    }
 }
 
 static int pull_bits(byte* input, int bytes, int* bp, int bits) {
@@ -112,7 +129,16 @@ static int pull_bits(byte* input, int bytes, int* bp, int bits) {
         const byte bv = (input[byte_pos] & (1 << bit_pos)) != 0; // bit value
         v |= (bv << i);
     }
-// printf("@%d,%d=%d\n", pos, bits, v);
+    int v1 = 0;
+    for (int i = 0; i < bits; i++) {
+        if (bits64 == 0) { r64 = *(uint64_t*)&input[(pos + i) / 8]; bits64 = 64; }
+        const byte bv = r64 & 0x1;
+        r64 >>= 1;
+        bits64--;
+        v1 |= (bv << i);
+    }
+    assert(v1 == v);
+//  printf("@%d,%d=%d\n", pos, bits, v);
     *bp = pos + bits;
     return v;
 }
@@ -135,6 +161,8 @@ static int k_freq[128];
 static int bits_freq[128];
 static int quo_freq[256];
 
+enum { cut_off = 4 };
+
 static int encode_entropy(byte* output, int count, int pos, int v, int bits) {
     // simple entropy encoding https://en.wikipedia.org/wiki/Golomb_coding for now
     // can be improved to https://en.wikipedia.org/wiki/Asymmetric_numeral_systems
@@ -143,10 +171,16 @@ static int encode_entropy(byte* output, int count, int pos, int v, int bits) {
 k_freq[bits]++;    
     int q = v >> bits; // v / m quotient
 int at = pos;
+    if (q < cut_off) {
+        pos = encode_unary(output, count, pos, q);
+        const int r = v & (m - 1); // v % m reminder (bits)
+        pos = push_bits(output, count, pos, r, bits);
 quo_freq[q]++;
-    pos = encode_unary(output, count, pos, q);
-    const int r = v & (m - 1); // v % m reminder (bits)
-    pos = push_bits(output, count, pos, r, bits);
+    } else {
+quo_freq[cut_off]++;
+        pos = encode_unary(output, count, pos, cut_off);
+        pos = push_bits(output, count, pos, v, 8);
+    }
 bits_freq[pos - at]++;
 if (pos - at == 1) { assert(bits == 0 && v == 0); }
 if (pos - at == 2 && v > 1) { printf("v=%d bits=%d\n", v, bits); }
@@ -171,8 +205,13 @@ static int decode_unary(byte* input, int bytes, int* pos) {
 
 static int decode_entropy(byte* input, int bytes, int* pos, int bits) {
     int q = decode_unary(input, bytes, pos);
-    int r = pull_bits(input, bytes, pos, bits);
-    int v = (q << bits) | r;
+    int v;
+    if (q < cut_off) {
+        int r = pull_bits(input, bytes, pos, bits);
+        v = (q << bits) | r;
+    } else {
+        v = pull_bits(input, bytes, pos, 8);
+    }
     return v;
 }
 
@@ -197,7 +236,6 @@ typedef struct neighbors_s { // RLE
 typedef struct encoder_context_s {
     int w;
     int h;
-    bool  rle;
     byte* data;
     byte* output;
     int   max_bytes; // number of bytes available in output
@@ -205,8 +243,6 @@ typedef struct encoder_context_s {
     byte* line; // current line
     int   bits; // bit-width of Golomb entropy encoding
     int   last; // last pixel value
-    int   lossy;
-    int   lossy2p1; // lossy * 2 + 1
     int   pos; // output bit position
     int   x;
     int   y;
@@ -215,6 +251,7 @@ typedef struct encoder_context_s {
 } encoder_context_t;
 
 static int prediction(int x, int y, int a, int b, int c) {
+#ifdef LOCO
     if (y == 0) {
         return x == 0 ? 0 : a;
     }
@@ -226,6 +263,9 @@ static int prediction(int x, int y, int a, int b, int c) {
     } else {
         return a + b - c;
     }
+#else
+    return x == 0 || y == 0 ? 0 : a;
+#endif
 }
 
 static void neighbors(int x, int y, int w, byte* prev, byte* line, neighbors_t* neighbors) {
@@ -245,63 +285,6 @@ static void neighbors(int x, int y, int w, byte* prev, byte* line, neighbors_t* 
 
 static void encode_delta(encoder_context_t* context, int v);
 
-static void encode_run(encoder_context_t* context, int count) {
-    #define ctx (*context)
-    if (count == 1) { // run == 1 encoded 2 bits as 0xb10
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1);
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 0, 1);
-    } else if (count <= 5) {
-        count -= 2; // 1 already encoded above 2 -> 0, 3 -> 1, 4 -> 2, 5 -> 3
-        assert(limit > 3);
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1); // unary(3)
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 1, 1);
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 0, 1);
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, count, 2);
-        // 5 bits 0xb110cc
-    } else {
-        count -= 6;
-        int lb = log2n(count);
-//      printf("@%d unary(%d) and %d bits of %d=0b%s\n", ctx.pos, lb + 2, lb, count, b2s(count, lb));
-        // deliberately not using encode_unary here because limit may be < lb
-        // need to add 2x"1" before unary lb (see above)
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, (1 << (lb + 2)) - 1, (lb + 2));
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, 0, 1);
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, count, lb);
-        // count 6 -> 0, 7 -> 1                     log2(count) == 1
-        //       8 -> 2, 9 -> 3,                    log2(count) == 2
-        //      10 -> 4, 11 -> 5, 12 -> 6, 13 -> 7  log2(count) == 3
-        // [10..13] encoded as 0b111110ccc (9 bit)
-        // ...
-        // 256-6 = 250 is encoded as 0b11,1111,1111,0,cccc,cccc (10 + 8 = 18 bit)
-    }
-//  printf("encode rle run count=%d @%d [%d,%d] last=%d\n", ctx.run, ctx.pos, ctx.x, ctx.y, ctx.last);
-    #undef ctx
-}
-
-static void encode_rle(encoder_context_t* context) {
-    #define ctx (*context)
-    int count = 0; // rle number of pixels in a run
-    while (ctx.x < ctx.w && abs(ctx.line[ctx.x] - ctx.last) <= ctx.lossy) {
-        ctx.line[ctx.x] = (byte)ctx.last; // corrected value
-        ctx.x++;
-        count++;
-    }
-    if (count > 0) {
-        encode_run(context, count);
-        ctx.x--; // will be incremented by for(x) loop
-    } else {
-        ctx.pos = push_bits(ctx.output, ctx.max_bytes,ctx.pos, 0, 1);
-        encode_delta(context, ctx.line[ctx.x]);
-    }
-    #undef ctx
-}
-
-static inline bool rle_mode(neighbors_t* neighbors, int lossy) {
-    #define ns (*neighbors)
-    return abs(ns.d1) <= lossy && abs(ns.d2) <= lossy && abs(ns.d3) <= lossy;
-    #undef ns
-}
-
 static int verify[1024][1024];
 
 static void encode_delta(encoder_context_t* context, int v) {
@@ -310,16 +293,6 @@ static void encode_delta(encoder_context_t* context, int v) {
     int predicted = prediction(ctx.x, ctx.y, ctx.neighbors.a, ctx.neighbors.b, ctx.neighbors.c);
     int delta = (byte)ctx.v - (byte)predicted;
     assert((byte)(predicted + delta) == (byte)ctx.v);
-    if (ctx.lossy > 0) {
-        // lossy adjustment
-        if (delta >= 0) {
-            delta = (ctx.lossy + delta) / ctx.lossy2p1;
-        } else {
-            delta = -(ctx.lossy - delta) / ctx.lossy2p1;
-        }
-        ctx.v = (byte)(predicted + delta * ctx.lossy2p1); // save reconstructed value
-        ctx.line[ctx.x] = (byte)ctx.v;  // need to write back resulting value
-    }
     delta = delta < 0 ? delta + 256 : delta;
     delta = delta >= 128 ? delta - 256 : delta;
     // this folds abs(deltas) > 128 to much smaller numbers which is OK
@@ -347,28 +320,22 @@ static int encode_context(encoder_context_t* context) {
     for (ctx.y = 0; ctx.y < ctx.h; ctx.y++) {
         for (ctx.x = 0; ctx.x < ctx.w; ctx.x++) {
             neighbors(ctx.x, ctx.y, ctx.w, ctx.prev, ctx.line, &ctx.neighbors);
-            // last == -1 at the beginning of line
-            if (ctx.rle && ctx.last >= 0 && rle_mode(&ctx.neighbors, ctx.lossy)) {
-                encode_rle(context);
-            } else {
-                encode_delta(context, ctx.line[ctx.x]);
-            }
+            encode_delta(context, ctx.line[ctx.x]);
         }
         ctx.prev = ctx.line;
         ctx.line += ctx.w;
         ctx.last = -1;
         ctx.bits = start_with_bits;
     }
+    flush_bits(ctx.output, ctx.pos);
     return (ctx.pos + 7) / 8;
     #undef ctx
 }
 
-int encode(byte* data, int w, int h, bool rle, int lossy, byte* output, int max_bytes) {
-    assert(lossy >= 0);
+int encode(byte* data, int w, int h, byte* output, int max_bytes) {
+    r64 = 0;
+    bits64 = 0;
     encoder_context_t ctx = {};
-    ctx.rle = rle;
-    ctx.lossy = lossy;
-    ctx.lossy2p1 = ctx.lossy * 2 + 1;
     ctx.data = data;
     ctx.w = w;
     ctx.h = h;
@@ -381,31 +348,12 @@ int encode(byte* data, int w, int h, bool rle, int lossy, byte* output, int max_
     // does not have to be encoded in the stream, may as well be simply known by both
     ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, w, 16);
     ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, h, 16);
-    ctx.pos = push_bits(ctx.output, ctx.max_bytes, ctx.pos, lossy, 8);
     return encode_context(&ctx);
 }
 
-static int decode_run(byte* input, int bytes, int *pos) { // return run count
-int at = *pos;
-    int bit = pull_bits(input, bytes, pos, 1);
-    if (bit == 0) { return 1; }
-    bit = pull_bits(input, bytes, pos, 1);
-    if (bit == 0) {
-        return pull_bits(input, bytes, pos, 2) + 2;
-    } else {
-        int lb = 3; // because we alread read two "1" "1" above
-        // deliberately not using decode_unary because limit may be < lb
-        for (;;) {
-            if (pull_bits(input, bytes, pos, 1) == 0) { break; }
-            lb++;
-        }
-        int count = pull_bits(input, bytes, pos, lb - 2) + 6;
-//      printf("@%d unary(%d) and %d bits of %d=0b%s\n", at, lb + 3, lb, count, b2s(count, lb));
-        return count;
-    }
-}
-
-int decode(byte* input, int bytes, bool rle, byte* output, int width, int height, int loss) {
+int decode(byte* input, int bytes, byte* output, int width, int height) {
+    r64 = 0;
+    bits64 = 0;
     byte* prev = null;
     byte* line = output;
     int pos = 0; // input bit position
@@ -413,45 +361,26 @@ int decode(byte* input, int bytes, bool rle, byte* output, int width, int height
     int last = -1;
     const int w = pull_bits(input, bytes, &pos, 16);
     const int h = pull_bits(input, bytes, &pos, 16);
-    const int lossy = pull_bits(input, bytes, &pos, 8);
-    const int lossy2p1 = lossy * 2 + 1;
-    assert(w == width && h == height && lossy == loss);
+    assert(w == width && h == height);
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             neighbors_t nei;
             neighbors(x, y, w, prev, line, &nei);
-            bool run_mode = rle && last >= 0 && rle_mode(&nei, lossy);
-            if (run_mode) {
-                run_mode = pull_bits(input, bytes, &pos, 1) != 0;
-            }
-            if (run_mode) {
-                int count = decode_run(input, bytes, &pos);
-//              printf("decode rle run count=%d @%d [%d,%d] last=%d\n", count, pos, x + count, y, last);
-                while (count > 0) { line[x] = (byte)last; x++; count--; }
-                assert(x <= w);
-                x--; // because it will be incremented by for loop above
-            } else {
-//if (x == 6 && y == 3) { __debugbreak(); }
-                int predicted = prediction(x, y, nei.a, nei.b, nei.c);
-                int at = pos; // only for printf below
-                int rice = decode_entropy(input, bytes, &pos, bits);
-//printf("[%d,%d] %d rice=%d bits=%d predicted=%d\n", x, y, pos, rice, bits, predicted);
-                assert(0 <= rice && rice <= 0xFF);
-                int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
-                if (lossy > 0) {
-                    delta *= lossy2p1;
-                }
-                int v = (byte)(predicted + delta);
-                assert(0 <= v && v <= 0xFF);
-                line[x] = (byte)v;
-                last = v;
-//              printf("[%3d,%-3d] predicted=%3d v=%3d rice=%4d delta=%4d bits=%d @%d\n",
-//                      x, y, predicted, v, rice, delta, bits, at);
+            int predicted = prediction(x, y, nei.a, nei.b, nei.c);
+            int at = pos; // only for printf below
+            int rice = decode_entropy(input, bytes, &pos, bits);
+// printf("[%d,%d] %d rice=%d bits=%d predicted=%d\n", x, y, pos, rice, bits, predicted);
+            assert(0 <= rice && rice <= 0xFF);
+            int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
+            int v = (byte)(predicted + delta);
+            assert(0 <= v && v <= 0xFF);
+            line[x] = (byte)v;
+            last = v;
+//          printf("[%3d,%-3d] predicted=%3d v=%3d rice=%4d delta=%4d bits=%d @%d\n",
+//                  x, y, predicted, v, rice, delta, bits, at);
 assert(at == verify[y][x]);
-                bits = 0;
-                while ((1 << bits) < rice) { bits++; }
-//if (bits > 1) { bits = log2n(rice); }
-            }
+            bits = 0;
+            while ((1 << bits) < rice) { bits++; }
         }
         last = -1;
         prev = line;
@@ -461,7 +390,7 @@ assert(at == verify[y][x]);
     return w * h;
 }
 
-static void d8x4_test(bool rle, int lossy) {
+static void d8x4_test() {
     enum { w = 8, h = 4, bytes = w * h };
 /*
     byte data[w * h] = {
@@ -480,74 +409,51 @@ static void d8x4_test(bool rle, int lossy) {
     byte copy[bytes];
     memcpy(copy, data, bytes);
     byte encoded[countof(data) * 2] = {};
-    int k = encode(data, w, h, rle, lossy, encoded, countof(encoded));
-hexdump(encoded, k);
+    int k = encode(data, w, h, encoded, countof(encoded));
+//  hexdump(encoded, k);
     byte decoded[countof(data)] = {};
-    int n = decode(encoded, k, rle, decoded, w, h, lossy);
+    int n = decode(encoded, k, decoded, w, h);
     assert(n == countof(data));
-    if (lossy == 0) {
-        assert(memcmp(decoded, data, n) == 0);
-    } else {
-        printf("error(rms) = %.1f%c\n", rms(decoded, copy, n) * 100, '%');
-    }
+    assert(memcmp(decoded, data, n) == 0);
     const int wh = w * h;
     const double bpp = k * 8 / (double)wh;
     const double percent = 100.0 * k / wh;
-    printf("%dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s\n",
-            w, h, wh, k, bpp, percent, '%', lossy, rle ? " RLE" : "");
+    printf("%dx%d %d->%d bytes %.3f bpp %.1f%c\n", w, h, wh, k, bpp, percent, '%');
 }
 
 static bool option_output;
-static int  option_lossy;
-static int  option_threshold;
 
-static void image_compress(const char* fn, bool rle, int lossy, bool write) {
+static void image_compress(const char* fn, bool write) {
     int w = 0;
     int h = 0;
     int c = 0;
     byte* data = stbi_load(fn, &w, &h, &c, 0);
     assert(c == 1);
     int bytes = w * h;
-    if (option_threshold != 0) {
-        assert(0 < option_threshold && option_threshold <= 0xFF);
-        for (int i = 0; i < bytes; i++) {
-            if (data[i] < option_threshold) { data[i] = 0; }
-        }
-    }
-    byte* encoded = (byte*)malloc(bytes * 3);
-    byte* decoded = (byte*)malloc(bytes);
-    byte* copy    = (byte*)malloc(bytes);
+    byte* encoded = (byte*)calloc(1, bytes * 3);
+    byte* decoded = (byte*)calloc(1, bytes);
+    byte* copy    = (byte*)calloc(1, bytes);
     memcpy(copy, data, bytes);
-    int k = encode(data, w, h, rle, lossy, encoded, bytes * 3);
-    int n = decode(encoded, k, rle, decoded, w, h, lossy);
+    int k = encode(data, w, h, encoded, bytes * 3);
+    int n = decode(encoded, k, decoded, w, h);
     assert(n == bytes);
-    if (lossy == 0) {
-        assert(memcmp(decoded, copy, n) == 0);
-    }
+    assert(memcmp(decoded, copy, n) == 0);
     char filename[128];
     const char* p = strrchr(fn, '.');
     int len = (int)(p - fn);
-    if (lossy != 0) {
-        sprintf(filename, "%.*s.lossy(%d)%s.png", len, fn, lossy, rle ? ".rle" : "");
-    } else {
-        sprintf(filename, "%.*s.loco%s.png", len, fn, rle ? ".rle" : "");
-    }
+    sprintf(filename, "%.*s.loco.png", len, fn);
     const char* file = strrchr(filename, '/');
     if (file == null) { file = filename; } else { file++; }
+    char out[128];
+    sprintf(out, "out/%s", file);
+    mkdir("out", S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
     if (write) {
-        stbi_write_png(file, w, h, 1, decoded, 0);
+        stbi_write_png(out, w, h, 1, decoded, 0);
     }
     const int wh = w * h;
     const double bpp = k * 8 / (double)wh;
     const double percent = 100.0 * k / wh;
-    if (lossy == 0) {
-        printf("%s %dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s\n",
-                file, w, h, wh, k, bpp, percent, '%', lossy, rle ? " RLE" : "");
-    } else {
-        printf("%s %dx%d %d->%d bytes %.3f bpp %.1f%c lossy(%d)%s rms(err) = %.1f%c\n",
-                file, w, h, wh, k, bpp, percent, '%', lossy, rle ? " RLE" : "",
-                rms(decoded, copy, n) * 100, '%');
-    }
+    printf("%s %dx%d %d->%d bytes %.3f bpp %.1f%c\n", file, w, h, wh, k, bpp, percent, '%');
     free(copy);
     free(encoded);
     free(decoded);
@@ -584,8 +490,6 @@ static void straighten(char* pathname) {
     while (strchr(pathname, '\\') != null) { *strchr(pathname, '\\') = '/'; }
 }
 
-#ifdef FOLDERS
-
 static void compress_folder(const char* folder_name) {
     folder_t folders = folder_open();
     int r = folder_enumerate(folders, folder_name);
@@ -595,7 +499,7 @@ static void compress_folder(const char* folder_name) {
     for (int i = 0; i < n; i++) {
         const char* name = folder_filename(folders, i);
         int pathname_length = (int)(strlen(folder) + strlen(name) + 3);
-        char* pathname = (char*)malloc(pathname_length);
+        char* pathname = (char*)calloc(1, pathname_length);
         if (pathname == null) { break; }
         snprintf(pathname, pathname_length, "%s/%s", folder, name);
         straighten(pathname);
@@ -603,28 +507,10 @@ static void compress_folder(const char* folder_name) {
         if (folder_is_folder(folders, i)) { suffix = "/"; }
         if (folder_is_symlink(folders, i)) { suffix = "->"; }
 //      printf("%s%s\n", pathname, suffix);
-        image_compress(pathname, false, 0, true);
-        image_compress(pathname, true,  0, true);
-        image_compress(pathname, false, 1, true);
-        image_compress(pathname, true,  1, true);
+        image_compress(pathname, true);
         free(pathname);
     }
     folder_close(folders);
-}
-
-#endif
-
-static int option_int(int argc, const char* argv[], const char* opt, int *n) {
-    for (int i = 0; i < argc; i++) {
-        int t = 0;
-        if (sscanf(argv[i], opt, &t) == 1) {
-            *n = t;
-            for (int j = i + 1; j < argc; j++) { argv[i] = argv[j]; }
-            argc--;
-            break;
-        }
-    }
-    return argc;
 }
 
 static int option_bool(int argc, const char* argv[], const char* opt, bool *b) {
@@ -646,15 +532,14 @@ static int sum(int a[], int n) {
 }
 
 
-int main(int argc, const char* argv[]) {
+static int everything = 1;
+
+static int run(int argc, const char* argv[]) {
     setbuf(stdout, null);
     argc = option_bool(argc, argv, "-o", &option_output);
-    argc = option_int(argc, argv, "-n=%d", &option_lossy);
-    argc = option_int(argc, argv, "-t=%d", &option_threshold);
     delta_modulo_folding(1, false);
 //  delta_modulo_folding(63, true);
-    image_compress("thermo-foil.png", false, 0, option_output);
-
+    image_compress("thermo-foil.png", option_output);
     printf("k freq:\n");
     int k_sum = sum(k_freq, countof(k_freq));
     for (int i = 0; i < countof(k_freq); i++) {
@@ -678,29 +563,22 @@ int main(int argc, const char* argv[]) {
             printf("%2d %7d %5.1f%% %5.1f%%\n", i, quo_freq[i], quo_freq[i] * 100.0 / quo_sum, sum(quo_freq, i + 1) * 100.0 / quo_sum);
         }
     }
-if (1) exit(0);    
-    d8x4_test(false, 0); // w/o RLE
-    d8x4_test(true, 0);  // with RLE lossless
-    d8x4_test(true, 1);  // with RLE lossy
-    image_compress("greyscale.128x128.pgm", false, 0, option_output);
-    image_compress("greyscale.128x128.pgm", true,  0, option_output);
-    image_compress("greyscale.128x128.pgm", true,  1, option_output);
-    image_compress("greyscale.640x480.pgm", false, 0, option_output);
-    image_compress("greyscale.640x480.pgm", true,  0, option_output);
-    image_compress("greyscale.640x480.pgm", false, 1, option_output);
-    image_compress("greyscale.640x480.pgm", true,  1, option_output);
-    image_compress("greyscale.640x480.pgm", true,  2, option_output);
-    image_compress("greyscale.640x480.pgm", true,  3, option_output);
-    image_compress("greyscale.640x480.pgm", true,  4, option_output);
-    image_compress("thermo-foil.png", true, 1, option_output);
-#ifdef FOLDERS
+    if (everything) {
+        d8x4_test();
+        image_compress("greyscale.128x128.pgm", option_output);
+        image_compress("greyscale.640x480.pgm", option_output);
+        image_compress("thermo-foil.png", option_output);
+    }
     while (argc > 1 && is_folder(argv[1])) {
         compress_folder(argv[1]);
         memmove(&argv[1], &argv[2], (argc - 2) * sizeof(argv[1]));
         argc--;
     }
-#endif    
     return 0;
+}
+
+int main(int argc, const char* argv[]) {
+    run(argc, argv);
 }
 
 #ifdef __cplusplus
