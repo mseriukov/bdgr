@@ -18,6 +18,7 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 
 #include "folders.h"
 
@@ -34,8 +35,6 @@
 #define null NULL // beautification of code
 #define byte uint8_t
 #define countof(a) (sizeof(a) / sizeof((a)[0]))
-#define minimum(a, b) ((a) < (b) ? (a) : (b))
-#define maximum(a, b) ((a) > (b) ? (a) : (b))
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,205 +45,135 @@ enum {
     start_with_bits = 3 // must be the same in encode and decode
 };
 
-typedef struct encoder_context_s {
-    int w;
-    int h;
-    byte* data;
-    byte* output;
-    int   max_bytes; // number of bytes available in output
-    byte* line; // current line
-    int   bits; // bit-width of Golomb entropy encoding
-    int   x;
-    int   y;
-    int   v; // current pixel value at [x,y]
-    int   prediction;
-    // bitstream:
-    uint64_t* p;
-    uint64_t* e;
-    uint64_t r64;
-    int bits64;
-} encoder_context_t;
+#define done while (false)
 
-static void push_bits(encoder_context_t* context, int v, int bits) {
-    #define ctx (*context)
-    assert(0 <= v);
-    assert(bits <= 31);
-    for (int i = 0; i < bits; i++) {
-        ctx.r64 = ctx.r64 >> 1;
-        if (v & 0x1) { ctx.r64 |= (1UL << 63); }
-	v >>= 1;
-        ctx.bits64++;
-        if (ctx.bits64 == 64) {
-            *ctx.p = ctx.r64;
-            ctx.bits64 = 0;
-            ctx.r64 = 0;
-            ctx.p++;
-        }
-    }
-    #undef ctx
-}
+#define push_out(p, e, b64, count) do {                         \
+    count++;                                                    \
+    if (count == 64) { *p++ = b64; count = 0; assert(p <= e); } \
+} done
 
-void flush_bits(encoder_context_t* context) {
-    #define ctx (*context)
-    if (ctx.bits64 > 0) {
-        ctx.r64 >>= 64 - ctx.bits64;
-        *ctx.p = ctx.r64;
-        ctx.p++;
-    }
-    #undef ctx
-}
+#define push_bit_0(b64) b64 >>= 1
 
-static void encode_unary(encoder_context_t* context, int q) { // encode q as unary
-    while (q > 0) { push_bits(context, 1, 1); q--; }
-    push_bits(context, 0, 1);
-}
+#define push_bit_1(b64) b64 = (1UL << 63) | (b64 >> 1)
 
-static void encode_entropy(encoder_context_t* context, int v, int bits) {
-    assert(0 <= v && v <= 0xFF);
-    const int m = 1 << bits;
-    int q = v >> bits; // v / m quotient
-    if (q < cut_off) {
-        encode_unary(context, q);
-        const int r = v & (m - 1); // v % m reminder (bits)
-        push_bits(context, r, bits);
-    } else {
-        encode_unary(context, cut_off);
-        push_bits(context, v, 8);
-    }
-}
+#define push_bits(p, e, b64, count, val, bits) do {               \
+    int v = val;                                                  \
+    for (int i = 0; i < bits; i++) {                              \
+	if (v & 1) { push_bit_1(b64); } else { push_bit_0(b64); } \
+	push_out(p, e, b64, count);                               \
+	v >>= 1;                                                  \
+    }                                                             \
+} done
 
-static void encode_delta(encoder_context_t* context, int v);
-
-static void encode_delta(encoder_context_t* context, int v) {
-    #define ctx (*context)
-    ctx.v = v;
-    int predicted = ctx.prediction;
-    int delta = (byte)ctx.v - (byte)predicted;
-    assert((byte)(predicted + delta) == (byte)ctx.v);
-    delta = delta < 0 ? delta + 256 : delta;
-    delta = delta >= 128 ? delta - 256 : delta;
-    // this folds abs(deltas) > 128 to much smaller numbers which is OK
-    assert(-128 <= delta && delta <= 127);
-    // delta:    -128 ... -2, -1, 0, +1, +2 ... + 127
-    // positive:                  0,  2,  4       254
-    // negative:  255      3   1
-    int rice = delta >= 0 ? delta * 2 : -delta * 2 - 1;
-    assert(0 <= rice && rice <= 0xFF);
-    encode_entropy(context, rice, ctx.bits);
-    ctx.bits = 0;
-    while ((1 << ctx.bits) < rice) { ctx.bits++; }
-    #undef ctx
-}
-
-static int encode_context(encoder_context_t* context) {
-    #define ctx (*context)
-    ctx.prediction = 0;
-    for (ctx.y = 0; ctx.y < ctx.h; ctx.y++) {
-        for (ctx.x = 0; ctx.x < ctx.w; ctx.x++) {
-            encode_delta(context, ctx.line[ctx.x]);
-            ctx.prediction = ctx.v;
-        }
-        ctx.line += ctx.w;
-        ctx.bits = start_with_bits;
-    }
-    flush_bits(context);
-    return (int)((byte*)ctx.p - ctx.output); // in 64 bits increments
-    #undef ctx
-}
-
-int encode(byte* data, int w, int h, byte* output, int max_bytes) {
+int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
     assert(max_bytes % 8 == 0);
-    encoder_context_t ctx = {};
-    ctx.data = data;
-    ctx.w = w;
-    ctx.h = h;
-    ctx.output = output;
-    ctx.max_bytes = max_bytes;
-    ctx.bits = start_with_bits; // m = (1 << bits)
-    ctx.line = data;
-    ctx.r64 = 0;
-    ctx.bits64 = 0;
-    ctx.p = (uint64_t*)output;
-    ctx.e = (uint64_t*)(output + max_bytes);
+    uint64_t b64 = 0;
+    int count = 0;
+    uint64_t* p = (uint64_t*)output;
+    const uint64_t* end = (uint64_t*)(output + max_bytes);
     // shared knowledge between encoder and decoder:
     // does not have to be encoded in the stream, may as well be simply known by both
-    push_bits(&ctx, w, 16);
-    push_bits(&ctx, h, 16);
-    return encode_context(&ctx);
-}
-
-typedef struct decoder_context_s {
-    // bitstream:
-    uint64_t* p;
-    uint64_t* e;
-    uint64_t r64;
-    int bits64;
-} decoder_context_t;
-
-static int pull_bits(decoder_context_t* context, int bits) {
-    #define ctx (*context)
-    assert(bits < 31);
-    int v = 0;
-    for (int i = 0; i < bits; i++) {
-        if (ctx.bits64 == 0) { ctx.r64 = *ctx.p; ctx.bits64 = 64; ctx.p++; }
-        v |= (((int)ctx.r64 & 0x1) << i);
-        ctx.r64 >>= 1;
-        ctx.bits64--;
-    }
-    #undef ctx
-    return v;
-}
-
-static int decode_unary(decoder_context_t* context) {
-    int q = 0;
-    for (;;) {
-        int bit = pull_bits(context, 1);
-        if (bit == 0) { break; }
-        q++;
-    }
-    return q;
-}
-
-static int decode_entropy(decoder_context_t* context, int bits) {
-    int q = decode_unary(context);
-    int v;
-    if (q < cut_off) {
-        int r = pull_bits(context, bits);
-        v = (q << bits) | r;
-    } else {
-        v = pull_bits(context, 8);
-    }
-    return v;
-}
-
-int decode(byte* input, int bytes, byte* output, int width, int height) {
-    assert(bytes % 8 == 0);
-    decoder_context_t ctx = {};
-    ctx.r64 = 0;
-    ctx.bits64 = 0;
-    ctx.p = (uint64_t*)input;
-    ctx.e = (uint64_t*)(input + bytes);
-    byte* line = output;
-    int bits  = start_with_bits;
-    const int w = pull_bits(&ctx, 16);
-    const int h = pull_bits(&ctx, 16);
-    assert(w == width && h == height);
-    int prediction = 0;
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            int predicted = prediction;
-            int rice = decode_entropy(&ctx, bits);
-            assert(0 <= rice && rice <= 0xFF);
-            int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
-            int v = (byte)(predicted + delta);
-            assert(0 <= v && v <= 0xFF);
-            line[x] = (byte)v;
-            prediction = v;
-            bits = 0;
-            while ((1 << bits) < rice) { bits++; }
+    push_bits(p, end, b64, count, w, 16);
+    push_bits(p, end, b64, count, h, 16);
+    int bits = start_with_bits;
+    byte prediction = 0;
+    const byte* s = data;
+    const byte* e = s + w * h;
+    while (s < e) {
+        byte v = *s++;
+        int delta = v - prediction;
+        assert((byte)(prediction + delta) == v);
+        delta = delta < 0 ? delta + 256 : delta;
+        delta = delta >= 128 ? delta - 256 : delta;
+        // this folds abs(deltas) > 128 to much smaller numbers which is OK
+        assert(-128 <= delta && delta <= 127);
+        // delta:    -128 ... -2, -1, 0, +1, +2 ... + 127
+        // positive:                  0,  2,  4       254
+        // negative:  255      3   1
+        int rice = delta >= 0 ? delta * 2 : -delta * 2 - 1;
+        assert(0 <= rice && rice <= 0xFF);
+        const int m = 1 << bits;
+        int q = rice >> bits; // rice / m quotient
+        if (q < cut_off) {
+            while (q > 0) { push_bit_1(b64); push_out(p, end, b64, count); q--; }
+            push_bit_0(b64); push_out(p, end, b64, count);
+            const int r = rice & (m - 1); // v % m reminder (bits)
+            push_bits(p, end, b64, count, r, bits);
+        } else {
+            q = cut_off;
+            while (q > 0) { push_bit_1(b64); push_out(p, end, b64, count); q--; }
+            push_bit_0(b64); push_out(p, end, b64, count);
+            push_bits(p, end, b64, count, rice, 8);
         }
-        line += w;
-        bits = start_with_bits;
+        bits = 0;
+        while ((1 << bits) < rice) { bits++; }
+        prediction = v;
+    }
+    if (count > 0) { // flush last bits
+        b64 >>= 64 - count;
+        *p++ = b64;
+    }
+    return (int)((byte*)p - output); // in 64 bits increments
+}
+
+#define pull_in(p, b64, count) do { \
+    if (count == 0) { b64 = *p++; count = 64; } \
+} done
+
+#define pull_in_1(v, p, b64, count) do { \
+    pull_in(p, b64, count);              \
+    v = (int)b64 & 1;                    \
+    b64 >>= 1;                           \
+    count--;                             \
+} done
+
+#define pull_bits(v, p, b64, count, bits) do { \
+    v = 0;                               \
+    int mask = 1;                        \
+    for (int i = 0; i < bits; i++) {     \
+    	pull_in(p, b64, count);          \
+	if ((int)b64 & 1) { v |= mask; } \
+	mask <<= 1;                      \
+        b64 >>= 1;                       \
+        count--;                         \
+    }                                    \
+} done
+
+int decode(const byte* input, int bytes, byte* output, int width, int height) {
+    assert(bytes % 8 == 0);
+    uint64_t b64 = 0;
+    int count = 0;
+    uint64_t* p = (uint64_t*)input;
+    int bits  = start_with_bits;
+    int w; pull_bits(w, p, b64, count, 16);
+    int h; pull_bits(h, p, b64, count, 16);
+    assert(w == width && h == height);
+    byte* d = output;
+    byte* end = output + w * h;
+    byte prediction = 0;
+    while (d < end) {
+        int q = 0;
+        for (;;) {
+            int bit;
+            pull_in_1(bit, p, b64, count);
+            if (bit == 0) { break; }
+            q++;
+        }
+        int rice;
+        if (q < cut_off) {
+            int r;
+            pull_bits(r, p, b64, count, bits);
+            rice = (q << bits) | r;
+        } else {
+            pull_bits(rice, p, b64, count, 8);
+        }
+        assert(0 <= rice && rice <= 0xFF);
+        int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
+        byte v = (byte)(prediction + delta);
+        *d++ = v;
+        prediction = v;
+        bits = 0;
+        while ((1 << bits) < rice) { bits++; }
     }
     return w * h;
 }
@@ -259,6 +188,20 @@ static double time_in_seconds() {
     return (ns - ns0) / (double)BILLION;
 }
 
+static void* mem_alloc(int bytes) {
+    bytes = (bytes + 7) / 8 * 8;
+    void* a = mmap(0, bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
+    if (a != null) { mlock(a, bytes); memset(a, 0, bytes); }
+    return a;
+}
+
+static void mem_free(void* a, int bytes) {
+    if (a != null) {
+	munlock(a, bytes);
+    	munmap(a, bytes);
+    }
+}
+
 static void image_compress(const char* fn) {
     int w = 0;
     int h = 0;
@@ -266,18 +209,19 @@ static void image_compress(const char* fn) {
     byte* data = stbi_load(fn, &w, &h, &c, 0);
     assert(c == 1);
     int bytes = w * h;
-    byte* encoded = (byte*)calloc(1, bytes * 3);
-    byte* decoded = (byte*)calloc(1, bytes);
-    byte* copy    = (byte*)calloc(1, bytes);
+    byte* encoded = (byte*)mem_alloc(bytes * 3);
+    byte* decoded = (byte*)mem_alloc(bytes);
+    byte* copy    = (byte*)mem_alloc(bytes);
     memcpy(copy, data, bytes);
     double encode_time = time_in_seconds();
-    int k = encode(data, w, h, encoded, bytes * 3);
+    int k = encode(copy, w, h, encoded, bytes * 3);
     encode_time = time_in_seconds() - encode_time;
     double decode_time = time_in_seconds();
     int n = decode(encoded, k, decoded, w, h);
     decode_time = time_in_seconds() - decode_time;
     assert(n == bytes);
-    assert(memcmp(decoded, copy, n) == 0);
+    assert(memcmp(decoded, data, n) == 0);
+    // write resulting image into out/*.png file
     char filename[128];
     const char* p = strrchr(fn, '.');
     int len = (int)(p - fn);
@@ -291,11 +235,11 @@ static void image_compress(const char* fn) {
     const int wh = w * h;
     const double bpp = k * 8 / (double)wh;
     const double percent = 100.0 * k / wh;
-    printf("%s \t %dx%d %6d->%-6d bytes %.3f bpp %.1f%c eoncode %.6fs decode %.6fs\n",
+    printf("%s \t %dx%d %6d->%-6d bytes %.3f bpp %.1f%c eoncode %.4fs decode %.4fs\n",
     	   file, w, h, wh, k, bpp, percent, '%', encode_time, decode_time);
-    free(copy);
-    free(encoded);
-    free(decoded);
+    mem_free(copy, bytes);
+    mem_free(decoded, bytes);
+    mem_free(encoded, bytes * 3);
     stbi_image_free(data);
 }
 
@@ -316,9 +260,6 @@ static void compress_folder(const char* folder_name) {
         if (pathname == null) { break; }
         snprintf(pathname, pathname_length, "%s/%s", folder, name);
         straighten(pathname);
-        const char* suffix = "";
-        if (folder_is_folder(folders, i)) { suffix = "/"; }
-        if (folder_is_symlink(folders, i)) { suffix = "->"; }
         image_compress(pathname);
         free(pathname);
     }
