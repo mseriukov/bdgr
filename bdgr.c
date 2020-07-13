@@ -18,7 +18,11 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
 #include <sys/mman.h>
+#endif
 
 #include "folders.h"
 
@@ -40,12 +44,53 @@
 extern "C" {
 #endif
 
+/*
+cut_off -> compression (average over ~40 images):
+   5  38.01%
+   6  37.80% ** (small but already almost optimal)
+   7  37.56%
+   8  37.51%
+   9  37.43%
+  10  37.42%
+  11  37.40% *** (empirically optimal)
+  12  37.41%
+  13  37.40%
+  14  37.42%
+  15  37.43%
+  ... steadily grows after that ...
+*/
+
 enum {
-    cut_off = 4,
-    start_with_bits = 3 // must be the same in encode and decode
+    cut_off = 11,
+    start_with_bits = 7 // must be the same in encode and decode
 };
 
+#if defined(__clang__) || defined(__GNUC__)
+    #define clz(x) __builtin_clz(x)
+#elif defined(_MSC_VER)
+    static __forceinline uint32_t clz(uint32_t x) { int r = 0; _BitScanForward(&r, x); return r; }
+#endif
+
+#ifdef __clang__ // None of those below seem to noticably affect performance:
+#pragma loop vectorize(enable)
+#pragma loop interleave(enable)
+#pragma loop unroll(enable)
+#pragma loop unroll(full)
+#pragma loop distribute(enable)
+#endif
+
 #define done while (false)
+
+#define bits_estimate(bits, rice) do {      \
+    bits = 0;                               \
+    while ((1 << bits) < rice) { bits++; }  \
+} done
+
+// bits_estimate can be replaced with (almost but not exactly similar)
+// #define bits_estimate(bits, rice) bits = (32 - clz(rice))
+// same as: while ((1 << bits) <= rice) { bits++; } (note: "<=" instead of "<")
+// which result is a bit less compression and a bit of performance savings:
+// 35.49% -> 37.40% and time encode 4.8ms -> 4.3ms decode 4.6ms  -> 4.0ms
 
 #define push_out(p, e, b64, count) do {                         \
     count++;                                                    \
@@ -105,8 +150,11 @@ int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
             push_bit_0(b64); push_out(p, end, b64, count);
             push_bits(p, end, b64, count, rice, 8);
         }
-        bits = 0;
-        while ((1 << bits) < rice) { bits++; }
+        if (rice == 0) { // because clz(0) is undefined...
+            bits = 0;
+        } else {
+            bits_estimate(bits, rice);
+        }
         prediction = v;
     }
     if (count > 0) { // flush last bits
@@ -172,8 +220,11 @@ int decode(const byte* input, int bytes, byte* output, int width, int height) {
         byte v = (byte)(prediction + delta);
         *d++ = v;
         prediction = v;
-        bits = 0;
-        while ((1 << bits) < rice) { bits++; }
+        if (rice == 0) { // because clz(0) is undefined...
+            bits = 0;
+        } else {
+            bits_estimate(bits, rice);
+        }
     }
     return w * h;
 }
@@ -188,10 +239,11 @@ static double time_in_seconds() {
     return (ns - ns0) / (double)BILLION;
 }
 
-static void* mem_alloc(int bytes) {
+static void* mem_alloc(int bytes) { // 64 bit aligned, locked, zero initialized
     bytes = (bytes + 7) / 8 * 8;
     void* a = mmap(0, bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
     if (a != null) { mlock(a, bytes); memset(a, 0, bytes); }
+    assert(((uintptr_t)a & 0x1F) == 0);
     return a;
 }
 
@@ -202,6 +254,13 @@ static void mem_free(void* a, int bytes) {
     }
 }
 
+// stats:
+
+static double percentage_sum;
+static double encode_time_sum;
+static double decode_time_sum;
+static int    run_count;
+
 static void image_compress(const char* fn) {
     int w = 0;
     int h = 0;
@@ -209,12 +268,12 @@ static void image_compress(const char* fn) {
     byte* data = stbi_load(fn, &w, &h, &c, 0);
     assert(c == 1);
     int bytes = w * h;
-    byte* encoded = (byte*)mem_alloc(bytes * 3);
+    byte* encoded = (byte*)mem_alloc(bytes * 4);
     byte* decoded = (byte*)mem_alloc(bytes);
     byte* copy    = (byte*)mem_alloc(bytes);
     memcpy(copy, data, bytes);
     double encode_time = time_in_seconds();
-    int k = encode(copy, w, h, encoded, bytes * 3);
+    int k = encode(copy, w, h, encoded, bytes * 4);
     encode_time = time_in_seconds() - encode_time;
     double decode_time = time_in_seconds();
     int n = decode(encoded, k, decoded, w, h);
@@ -235,11 +294,15 @@ static void image_compress(const char* fn) {
     const int wh = w * h;
     const double bpp = k * 8 / (double)wh;
     const double percent = 100.0 * k / wh;
-    printf("%s \t %dx%d %6d->%-6d bytes %.3f bpp %.1f%c eoncode %.4fs decode %.4fs\n",
+    printf("%s \t %dx%d %6d->%-6d bytes %.3f bpp %.1f%c encode %.4fs decode %.4fs\n",
     	   file, w, h, wh, k, bpp, percent, '%', encode_time, decode_time);
+    percentage_sum  += percent;
+    encode_time_sum += encode_time;
+    decode_time_sum += decode_time;
+    run_count++;
     mem_free(copy, bytes);
     mem_free(decoded, bytes);
-    mem_free(encoded, bytes * 3);
+    mem_free(encoded, bytes * 4);
     stbi_image_free(data);
 }
 
@@ -282,6 +345,8 @@ static int run(int argc, const char* argv[]) {
 
 int main(int argc, const char* argv[]) {
     run(argc, argv);
+    printf("avergage %.2f%c encode %.4fs decode %.4fs\n",
+           percentage_sum / run_count, '%', encode_time_sum / run_count, decode_time_sum / run_count);
 }
 
 #ifdef __cplusplus
