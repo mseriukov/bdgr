@@ -31,11 +31,6 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
-#ifdef _MSC_VER // 1200, 1300, ...
-#pragma warning(disable: 4189) // local variable is initialized but not referenced
-#pragma warning(disable: 4505) // unreferenced local function has been removed
-#endif
-
 #define null NULL // beautification of code
 #define byte uint8_t
 #define countof(a) (sizeof(a) / sizeof((a)[0]))
@@ -44,40 +39,15 @@
 extern "C" {
 #endif
 
-/*
-cut_off -> compression (average over ~40 images):
-   5  38.01%
-   6  37.80% ** (small but already almost optimal)
-   7  37.56%
-   8  37.51%
-   9  37.43%
-  10  37.42%
-  11  37.40% *** (empirically optimal)
-  12  37.41%
-  13  37.40%
-  14  37.42%
-  15  37.43%
-  ... steadily grows after that ...
-*/
+#ifndef DEBUG
+#undef  assert
+#define assert(x) // osx Xcode clang build keeps asserts in release
+#endif
 
-enum {
+enum { // must be the same in encode and decode
     cut_off = 11,
-    start_with_bits = 7 // must be the same in encode and decode
+    start_with_bits = 7
 };
-
-#if defined(__clang__) || defined(__GNUC__)
-    #define clz(x) __builtin_clz(x)
-#elif defined(_MSC_VER)
-    static __forceinline uint32_t clz(uint32_t x) { int r = 0; _BitScanForward(&r, x); return r; }
-#endif
-
-#ifdef __clang__ // None of those below seem to noticably affect performance:
-#pragma loop vectorize(enable)
-#pragma loop interleave(enable)
-#pragma loop unroll(enable)
-#pragma loop unroll(full)
-#pragma loop distribute(enable)
-#endif
 
 #define done while (false)
 
@@ -85,12 +55,6 @@ enum {
     bits = 0;                               \
     while ((1 << bits) < rice) { bits++; }  \
 } done
-
-// bits_estimate can be replaced with (almost but not exactly similar)
-// #define bits_estimate(bits, rice) bits = (32 - clz(rice))
-// same as: while ((1 << bits) <= rice) { bits++; } (note: "<=" instead of "<")
-// which result is a bit less compression and a bit of performance savings:
-// 35.49% -> 37.40% and time encode 4.8ms -> 4.3ms decode 4.6ms  -> 4.0ms
 
 #define push_out(p, e, b64, count) do {                         \
     count++;                                                    \
@@ -112,10 +76,10 @@ enum {
 
 int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
     assert(max_bytes % 8 == 0);
+    const uint64_t* end = (uint64_t*)(output + max_bytes);
     uint64_t b64 = 0;
     int count = 0;
     uint64_t* p = (uint64_t*)output;
-    const uint64_t* end = (uint64_t*)(output + max_bytes);
     // shared knowledge between encoder and decoder:
     // does not have to be encoded in the stream, may as well be simply known by both
     push_bits(p, end, b64, count, w, 16);
@@ -161,6 +125,7 @@ int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
         b64 >>= 64 - count;
         *p++ = b64;
     }
+    (void)end; // for the performance reasons max_bytes is NOT checked in release build
     return (int)((byte*)p - output); // in 64 bits increments
 }
 
@@ -278,7 +243,7 @@ static void image_compress(const char* fn) {
     double decode_time = time_in_seconds();
     int n = decode(encoded, k, decoded, w, h);
     decode_time = time_in_seconds() - decode_time;
-    assert(n == bytes);
+    assert(n == bytes); (void)n;
     assert(memcmp(decoded, data, n) == 0);
     // write resulting image into out/*.png file
     char filename[128];
