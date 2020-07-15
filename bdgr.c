@@ -145,8 +145,8 @@ int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
     int mask = 1;                        \
     for (int i = 0; i < bits; i++) {     \
     	pull_in(p, b64, count);          \
-	if ((int)b64 & 1) { v |= mask; } \
-	mask <<= 1;                      \
+        if ((int)b64 & 1) { v |= mask; } \
+	    mask <<= 1;                      \
         b64 >>= 1;                       \
         count--;                         \
     }                                    \

@@ -16,6 +16,10 @@ extern "C" {
 
 #include <stdbool.h>
 
+#ifdef __clang__
+#pragma clang diagnostic ignored "-Wstrict-prototypes"
+#endif
+
 typedef void* folder_t;
 
 int is_folder(const char* pathname); // != 0 when pathname is a folder otherwise 0 and errno
