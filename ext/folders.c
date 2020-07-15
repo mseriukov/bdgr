@@ -259,6 +259,7 @@ int folder_enumerate(folder_t fd, const char* folder) {
                 break;
             }
             if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) { continue; }
+            if (strcmp(e->d_name, ".DS_Store") == 0) { continue; }
             if (f->n >= f->allocated) {
                 folder_data_t* r = (folder_data_t*)realloc(f->data, sizeof(folder_data_t) * f->allocated * 2);
                 if (r != null) { // out of memory - do the best we can, leave the rest for next pass
