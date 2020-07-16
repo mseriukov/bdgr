@@ -67,9 +67,7 @@ double time_in_seconds() {
 }
 
 static void* mem_alloc(int bytes) { // 64 bit aligned, locked, zero initialized
-    void* a = VirtualAllocEx(GetCurrentProcess(), null, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    printf("a=%p %d\n", a, bytes);
-    return a;
+    return VirtualAllocEx(GetCurrentProcess(), null, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
 
 static void mem_free(void* a, int bytes) {
@@ -172,7 +170,7 @@ static const int k4rice[256] = {
 #define done while (false)
 
 // k4rice is result of bits_estimate() for rice in [0..255]
-    
+
 #define bits_estimate(bits, rice) do {      \
     bits = 0;                               \
     while ((1 << bits) < rice) { bits++; }  \
@@ -180,7 +178,7 @@ static const int k4rice[256] = {
 } done
 
 // if (bits > 1) { bits--; } on average result in a bit better compression 0.5%
-    
+
 #define push_out(p, e, b64, count) do {                         \
     count++;                                                    \
     if (count == 64) { *p++ = b64; count = 0; assert(p <= e); } \
@@ -202,11 +200,12 @@ static const int k4rice[256] = {
 #ifndef WIN32
     #define ctz(x) __builtin_ctz(x)
 #else
-    static uint32_t __force_inline ctz(uint32_t x) {
-        int r = 0; assert(x != 0); _BitScanReverse(&r, x); return r;
+    static uint32_t __forceinline ctz(uint32_t x) {
+        assert(x != 0);
+        unsigned long r = 0; assert(x != 0); _BitScanForward(&r, (unsigned long)x); return r;
     }
 #endif
-    
+
 int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
     assert(max_bytes % 8 == 0);
     const uint64_t* end = (uint64_t*)(output + max_bytes);
@@ -440,6 +439,7 @@ int main(int argc, const char* argv[]) {
     #if defined(WIN32) && defined(_DEBUG)
         getchar();
     #endif
+    return 0;
 }
 
 #ifdef __cplusplus
