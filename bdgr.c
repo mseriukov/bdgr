@@ -16,15 +16,20 @@
 #include <assert.h>
 #include <errno.h>
 #include <time.h>
-#include <io.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #ifdef _MSC_VER
-#include <intrin.h>
-#include <direct.h>
-#pragma warning(disable: 4996) // posix names
+    #include <intrin.h>
+    #include <direct.h>
+    #include <io.h>
+    #define VC_EXTRALEAN
+    #define WIN32_LEAN_AND_MEAN
+    #include "windows.h"
+    #include "memoryapi.h"
+    #pragma warning(disable: 4996) // posix names
 #else
-#include <sys/mman.h>
+    #include <unistd.h>
+    #include <sys/mman.h>
 #endif
 
 #include "folders.h"
@@ -48,10 +53,6 @@ extern "C" {
 #endif
 
 #ifdef WIN32
-#define VC_EXTRALEAN
-#define WIN32_LEAN_AND_MEAN
-#include "windows.h"
-#include "memoryapi.h"
 
 double time_in_seconds() {
     static int64_t freq = 0;
