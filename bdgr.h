@@ -92,7 +92,7 @@ static const int bdgr_k4rice[256] = {
     }                                                             \
 } done
 
-#ifndef __MSC_VER
+#ifndef _MSC_VER // using compiler identification instead of WIN32
     #define ctz(x) __builtin_ctz(x) // __builtin_ctz(0) is undefined!
 #else // Microsoft Windows version __builtin_ctz
     static uint32_t __forceinline ctz(uint32_t x) {
@@ -102,7 +102,7 @@ static const int bdgr_k4rice[256] = {
 
 int bdgr_encode(const void* data, int w, int h, void* output, int max_bytes) {
     implore(max_bytes % 8 == 0);
-    const uint64_t* end = (uint64_t*)(output + max_bytes);
+    const uint64_t* end = (uint64_t*)((byte*)output + max_bytes);
     uint64_t b64 = 0;
     int count = 0;
     uint64_t* p = (uint64_t*)output;
@@ -112,7 +112,7 @@ int bdgr_encode(const void* data, int w, int h, void* output, int max_bytes) {
     push_bits(p, end, b64, count, h, 16);
     int bits = bdgr_start_with_bits;
     byte prediction = 0;
-    const byte* s = data;
+    const byte* s = (byte*)data;
     const byte* e = s + w * h;
     while (s < e) {
         byte px = *s++;
@@ -184,8 +184,8 @@ int bdgr_decode(const void* input, int bytes, void* output, int width, int heigh
     int w; pull_bits(w, p, b64, count, 16);
     int h; pull_bits(h, p, b64, count, 16);
     implore(w == width && h == height); (void)width; (void)height;
-    byte* d = output;
-    byte* end = output + w * h;
+    byte* d = (byte*)output;
+    byte* end = d + w * h;
     byte prediction = 0;
     while (d < end) {
         int q = 0;
