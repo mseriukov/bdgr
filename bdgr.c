@@ -20,6 +20,8 @@
 #include <sys/stat.h>
 #ifdef _MSC_VER
 #include <intrin.h>
+#include <direct.h>
+#pragma warning(disable: 4996) // posix names
 #else
 #include <sys/mman.h>
 #endif
@@ -39,7 +41,7 @@
 extern "C" {
 #endif
 
-#ifndef DEBUG
+#if !defined(DEBUG) && !defined(_DEBUG)
 #undef  assert
 #define assert(x) // osx Xcode clang build keeps asserts in release
 #endif
@@ -63,7 +65,7 @@ enum { // must be the same in encode and decode
 
 #define push_bit_0(b64) b64 >>= 1
 
-#define push_bit_1(b64) b64 = (1UL << 63) | (b64 >> 1)
+#define push_bit_1(b64) b64 = (1ULL << 63) | (b64 >> 1)
 
 #define push_bits(p, e, b64, count, val, bits) do {               \
     int v = val;                                                  \
@@ -89,9 +91,9 @@ int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
     const byte* s = data;
     const byte* e = s + w * h;
     while (s < e) {
-        byte v = *s++;
-        int delta = v - prediction;
-        assert((byte)(prediction + delta) == v);
+        byte px = *s++;
+        int delta = px - prediction;
+        assert((byte)(prediction + delta) == px);
         delta = delta < 0 ? delta + 256 : delta;
         delta = delta >= 128 ? delta - 256 : delta;
         // this folds abs(deltas) > 128 to much smaller numbers which is OK
@@ -119,7 +121,7 @@ int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
         } else {
             bits_estimate(bits, rice);
         }
-        prediction = v;
+        prediction = px;
     }
     if (count > 0) { // flush last bits
         b64 >>= 64 - count;
@@ -254,7 +256,11 @@ static void image_compress(const char* fn) {
     if (file == null) { file = filename; } else { file++; }
     char out[128];
     sprintf(out, "out/%s", file);
-    mkdir("out", S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+    #ifndef WIN32
+        mkdir("out", S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+    #else
+        mkdir("out");
+    #endif
     stbi_write_png(out, w, h, 1, decoded, 0);
     const int wh = w * h;
     const double bpp = k * 8 / (double)wh;
