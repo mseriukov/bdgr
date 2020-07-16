@@ -168,7 +168,6 @@ static const int k4rice[256] = {
     7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
     7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7
 };
-    
 
 #define done while (false)
 
@@ -200,6 +199,14 @@ static const int k4rice[256] = {
     }                                                             \
 } done
 
+#ifndef WIN32
+    #define ctz(x) __builtin_ctz(x)
+#else
+    static uint32_t __force_inline ctz(uint32_t x) {
+        int r = 0; assert(x != 0); _BitScanReverse(&r, x); return r;
+    }
+#endif
+    
 int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
     assert(max_bytes % 8 == 0);
     const uint64_t* end = (uint64_t*)(output + max_bytes);
@@ -251,35 +258,36 @@ int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
     return (int)((byte*)p - output); // in 64 bits increments
 }
 
-#define pull_in(p, b64, count) do { \
+#define pull_in(p, b64, count) do {             \
     if (count == 0) { b64 = *p++; count = 64; } \
 } done
 
-#define pull_in_1(v, p, b64, count) do { \
-    pull_in(p, b64, count);              \
-    v = (int)b64 & 1;                    \
-    b64 >>= 1;                           \
-    count--;                             \
-} done
-
-#define pull_bits(v, p, b64, count, bits) do { \
-    v = 0;                               \
-    int mask = 1;                        \
-    for (int i = 0; i < bits; i++) {     \
-        pull_in(p, b64, count);          \
-        if ((int)b64 & 1) { v |= mask; } \
-        mask <<= 1;                      \
-        b64 >>= 1;                       \
-        count--;                         \
-    }                                    \
+#define pull_bits(v, p, b64, count, bits) do {  \
+    if (count >= bits) {                        \
+        v = (uint32_t)b64 & ((1U << bits) - 1); \
+        b64 >>= bits;                           \
+        count -= bits;                          \
+    } else {                                    \
+        v = 0;                                  \
+        int mask = 1;                           \
+        for (int i = 0; i < bits; i++) {        \
+            assert(count > 0);                  \
+            if ((int)b64 & 1) { v |= mask; }    \
+            mask <<= 1;                         \
+            b64 >>= 1;                          \
+            count--;                            \
+            pull_in(p, b64, count);             \
+        }                                       \
+    }                                           \
 } done
 
 int decode(const byte* input, int bytes, byte* output, int width, int height) {
     assert(bytes % 8 == 0); (void)bytes;
     uint64_t b64 = 0;
-    int count = 0;
+    int count = 0; // number of valid bits in b64
     uint64_t* p = (uint64_t*)input;
     int bits  = start_with_bits;
+    pull_in(p, b64, count); // pull in first 64 bits
     int w; pull_bits(w, p, b64, count, 16);
     int h; pull_bits(h, p, b64, count, 16);
     assert(w == width && h == height); (void)width; (void)height;
@@ -288,11 +296,23 @@ int decode(const byte* input, int bytes, byte* output, int width, int height) {
     byte prediction = 0;
     while (d < end) {
         int q = 0;
-        for (;;) {
-            int bit;
-            pull_in_1(bit, p, b64, count);
-            if (bit == 1) { break; }
-            q++;
+        pull_in(p, b64, count);
+        if (count > cut_off) {
+            assert(((uint32_t)b64) != 0);
+            q = ctz(((uint32_t)b64));
+            b64  >>= (q + 1);
+            count -= (q + 1);
+            pull_in(p, b64, count); // pull in next bits if necessary
+        } else { // not enough bits in b64, do it one by one
+            for (;;) {
+                assert(count > 0);
+                int bit = (int)b64 & 1;
+                b64 >>= 1;
+                count--;
+                pull_in(p, b64, count);
+                if (bit == 1) { break; }
+                q++;
+            }
         }
         int rice;
         if (q < cut_off) {
@@ -342,6 +362,10 @@ static void image_compress(const char* fn) {
     decode_time = time_in_seconds() - decode_time;
     assert(n == bytes); (void)n;
     assert(memcmp(decoded, data, n) == 0);
+    if (memcmp(decoded, data, n) != 0) {
+        fprintf(stderr, "decoded != original\n");
+        exit(1);
+    }
     // write resulting image into out/*.png file
     char filename[128];
     const char* p = strrchr(fn, '.');
@@ -397,9 +421,9 @@ static void compress_folder(const char* folder_name) {
 
 static int run(int argc, const char* argv[]) {
     setbuf(stdout, null);
+    image_compress("thermo-foil.png");
     image_compress("greyscale.128x128.pgm");
     image_compress("greyscale.640x480.pgm");
-    image_compress("thermo-foil.png");
     image_compress("lena512.png");
     while (argc > 1 && is_folder(argv[1])) {
         compress_folder(argv[1]);
@@ -413,7 +437,7 @@ int main(int argc, const char* argv[]) {
     run(argc, argv);
     printf("avergage %.2f%c encode %.4fs decode %.4fs\n",
            percentage_sum / run_count, '%', encode_time_sum / run_count, decode_time_sum / run_count);
-    #ifdef WIN32
+    #if defined(WIN32) && defined(_DEBUG)
         getchar();
     #endif
 }
