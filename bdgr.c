@@ -148,19 +148,40 @@ static void mem_free(void* a, int bytes) {
 
 #endif
 
-
 enum { // must be the same in encode and decode
     cut_off = 11,
     start_with_bits = 7
 };
 
+//  k4rice
+//  bits = 0;
+//  while ((1 << bits) < rice) { bits++; }
+//  if (bits > 1) { bits--; } // imperical: compresses a bit more
+
+static const int k4rice[256] = {
+    0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7
+};
+    
+
 #define done while (false)
 
+// k4rice is result of bits_estimate() for rice in [0..255]
+    
 #define bits_estimate(bits, rice) do {      \
     bits = 0;                               \
     while ((1 << bits) < rice) { bits++; }  \
+    if (bits > 1) { bits--; }               \
 } done
 
+// if (bits > 1) { bits--; } on average result in a bit better compression 0.5%
+    
 #define push_out(p, e, b64, count) do {                         \
     count++;                                                    \
     if (count == 64) { *p++ = b64; count = 0; assert(p <= e); } \
@@ -209,21 +230,17 @@ int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
         const int m = 1 << bits;
         int q = rice >> bits; // rice / m quotient
         if (q < cut_off) {
-            while (q > 0) { push_bit_1(b64); push_out(p, end, b64, count); q--; }
-            push_bit_0(b64); push_out(p, end, b64, count);
+            while (q > 0) { push_bit_0(b64); push_out(p, end, b64, count); q--; }
+            push_bit_1(b64); push_out(p, end, b64, count);
             const int r = rice & (m - 1); // v % m reminder (bits)
             push_bits(p, end, b64, count, r, bits);
         } else {
             q = cut_off;
-            while (q > 0) { push_bit_1(b64); push_out(p, end, b64, count); q--; }
-            push_bit_0(b64); push_out(p, end, b64, count);
+            while (q > 0) { push_bit_0(b64); push_out(p, end, b64, count); q--; }
+            push_bit_1(b64); push_out(p, end, b64, count);
             push_bits(p, end, b64, count, rice, 8);
         }
-        if (rice == 0) { // because clz(0) is undefined...
-            bits = 0;
-        } else {
-            bits_estimate(bits, rice);
-        }
+        bits = k4rice[rice];
         prediction = px;
     }
     if (count > 0) { // flush last bits
@@ -274,7 +291,7 @@ int decode(const byte* input, int bytes, byte* output, int width, int height) {
         for (;;) {
             int bit;
             pull_in_1(bit, p, b64, count);
-            if (bit == 0) { break; }
+            if (bit == 1) { break; }
             q++;
         }
         int rice;
@@ -290,11 +307,7 @@ int decode(const byte* input, int bytes, byte* output, int width, int height) {
         byte v = (byte)(prediction + delta);
         *d++ = v;
         prediction = v;
-        if (rice == 0) { // because clz(0) is undefined...
-            bits = 0;
-        } else {
-            bits_estimate(bits, rice);
-        }
+        bits = k4rice[rice];
     }
     return w * h;
 }
