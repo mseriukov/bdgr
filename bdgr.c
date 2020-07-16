@@ -39,6 +39,9 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+#define BDGR_IMPLEMENTATION
+#include "bdgr.h"
+
 #define null NULL // beautification of code
 #define byte uint8_t
 #define countof(a) (sizeof(a) / sizeof((a)[0]))
@@ -146,191 +149,6 @@ static void mem_free(void* a, int bytes) {
 
 #endif
 
-enum { // must be the same in encode and decode
-    cut_off = 11,
-    start_with_bits = 7
-};
-
-//  k4rice
-//  bits = 0;
-//  while ((1 << bits) < rice) { bits++; }
-//  if (bits > 1) { bits--; } // imperical: compresses a bit more
-
-static const int k4rice[256] = {
-    0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-    5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-    6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7
-};
-
-#define done while (false)
-
-// k4rice is result of bits_estimate() for rice in [0..255]
-
-#define bits_estimate(bits, rice) do {      \
-    bits = 0;                               \
-    while ((1 << bits) < rice) { bits++; }  \
-    if (bits > 1) { bits--; }               \
-} done
-
-// if (bits > 1) { bits--; } on average result in a bit better compression 0.5%
-
-#define push_out(p, e, b64, count) do {                         \
-    count++;                                                    \
-    if (count == 64) { *p++ = b64; count = 0; assert(p <= e); } \
-} done
-
-#define push_bit_0(b64) b64 >>= 1
-
-#define push_bit_1(b64) b64 = (1ULL << 63) | (b64 >> 1)
-
-#define push_bits(p, e, b64, count, val, bits) do {               \
-    int v = val;                                                  \
-    for (int i = 0; i < bits; i++) {                              \
-        if (v & 1) { push_bit_1(b64); } else { push_bit_0(b64); } \
-        push_out(p, e, b64, count);                               \
-        v >>= 1;                                                  \
-    }                                                             \
-} done
-
-#ifndef WIN32
-    #define ctz(x) __builtin_ctz(x)
-#else
-    static uint32_t __forceinline ctz(uint32_t x) {
-        assert(x != 0);
-        unsigned long r = 0; assert(x != 0); _BitScanForward(&r, (unsigned long)x); return r;
-    }
-#endif
-
-int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
-    assert(max_bytes % 8 == 0);
-    const uint64_t* end = (uint64_t*)(output + max_bytes);
-    uint64_t b64 = 0;
-    int count = 0;
-    uint64_t* p = (uint64_t*)output;
-    // shared knowledge between encoder and decoder:
-    // does not have to be encoded in the stream, may as well be simply known by both
-    push_bits(p, end, b64, count, w, 16);
-    push_bits(p, end, b64, count, h, 16);
-    int bits = start_with_bits;
-    byte prediction = 0;
-    const byte* s = data;
-    const byte* e = s + w * h;
-    while (s < e) {
-        byte px = *s++;
-        int delta = px - prediction;
-        assert((byte)(prediction + delta) == px);
-        delta = delta < 0 ? delta + 256 : delta;
-        delta = delta >= 128 ? delta - 256 : delta;
-        // this folds abs(deltas) > 128 to much smaller numbers which is OK
-        assert(-128 <= delta && delta <= 127);
-        // delta:    -128 ... -2, -1, 0, +1, +2 ... + 127
-        // positive:                  0,  2,  4       254
-        // negative:  255      3   1
-        int rice = delta >= 0 ? delta * 2 : -delta * 2 - 1;
-        assert(0 <= rice && rice <= 0xFF);
-        const int m = 1 << bits;
-        int q = rice >> bits; // rice / m quotient
-        if (q < cut_off) {
-            while (q > 0) { push_bit_0(b64); push_out(p, end, b64, count); q--; }
-            push_bit_1(b64); push_out(p, end, b64, count);
-            const int r = rice & (m - 1); // v % m reminder (bits)
-            push_bits(p, end, b64, count, r, bits);
-        } else {
-            q = cut_off;
-            while (q > 0) { push_bit_0(b64); push_out(p, end, b64, count); q--; }
-            push_bit_1(b64); push_out(p, end, b64, count);
-            push_bits(p, end, b64, count, rice, 8);
-        }
-        bits = k4rice[rice];
-        prediction = px;
-    }
-    if (count > 0) { // flush last bits
-        b64 >>= (64 - count);
-        *p++ = b64;
-    }
-    (void)end; // for the performance reasons max_bytes is NOT checked in release build
-    return (int)((byte*)p - output); // in 64 bits increments
-}
-
-#define pull_in(p, b64, count) do {             \
-    if (count == 0) { b64 = *p++; count = 64; } \
-} done
-
-#define pull_bits(v, p, b64, count, bits) do {  \
-    if (count >= bits) {                        \
-        v = (uint32_t)b64 & ((1U << bits) - 1); \
-        b64 >>= bits;                           \
-        count -= bits;                          \
-    } else {                                    \
-        v = 0;                                  \
-        int mask = 1;                           \
-        for (int i = 0; i < bits; i++) {        \
-            assert(count > 0);                  \
-            if ((int)b64 & 1) { v |= mask; }    \
-            mask <<= 1;                         \
-            b64 >>= 1;                          \
-            count--;                            \
-            pull_in(p, b64, count);             \
-        }                                       \
-    }                                           \
-} done
-
-int decode(const byte* input, int bytes, byte* output, int width, int height) {
-    assert(bytes % 8 == 0); (void)bytes;
-    uint64_t b64 = 0;
-    int count = 0; // number of valid bits in b64
-    uint64_t* p = (uint64_t*)input;
-    int bits  = start_with_bits;
-    pull_in(p, b64, count); // pull in first 64 bits
-    int w; pull_bits(w, p, b64, count, 16);
-    int h; pull_bits(h, p, b64, count, 16);
-    assert(w == width && h == height); (void)width; (void)height;
-    byte* d = output;
-    byte* end = output + w * h;
-    byte prediction = 0;
-    while (d < end) {
-        int q = 0;
-        pull_in(p, b64, count);
-        if (count > cut_off) {
-            assert(((uint32_t)b64) != 0);
-            q = ctz(((uint32_t)b64));
-            b64  >>= (q + 1);
-            count -= (q + 1);
-            pull_in(p, b64, count); // pull in next bits if necessary
-        } else { // not enough bits in b64, do it one by one
-            for (;;) {
-                assert(count > 0);
-                int bit = (int)b64 & 1;
-                b64 >>= 1;
-                count--;
-                pull_in(p, b64, count);
-                if (bit == 1) { break; }
-                q++;
-            }
-        }
-        int rice;
-        if (q < cut_off) {
-            int r;
-            pull_bits(r, p, b64, count, bits);
-            rice = (q << bits) | r;
-        } else {
-            pull_bits(rice, p, b64, count, 8);
-        }
-        assert(0 <= rice && rice <= 0xFF);
-        int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
-        byte v = (byte)(prediction + delta);
-        *d++ = v;
-        prediction = v;
-        bits = k4rice[rice];
-    }
-    return w * h;
-}
-
 // stats:
 
 static double percentage_sum;
@@ -354,10 +172,10 @@ static void image_compress(const char* fn) {
     byte* copy    = (byte*)mem_alloc(bytes);
     memcpy(copy, data, bytes);
     double encode_time = time_in_seconds();
-    int k = encode(copy, w, h, encoded, bytes * 4);
+    int k = bdgr_encode(copy, w, h, encoded, bytes * 4);
     encode_time = time_in_seconds() - encode_time;
     double decode_time = time_in_seconds();
-    int n = decode(encoded, k, decoded, w, h);
+    int n = bdgr_decode(encoded, k, decoded, w, h);
     decode_time = time_in_seconds() - decode_time;
     assert(n == bytes); (void)n;
     assert(memcmp(decoded, data, n) == 0);
@@ -383,7 +201,7 @@ static void image_compress(const char* fn) {
     const int wh = w * h;
     const double bpp = k * 8 / (double)wh;
     const double percent = 100.0 * k / wh;
-    printf("%s \t %dx%d %6d->%-6d bytes %.3f bpp %.1f%c encode %.4fs decode %.4fs\n",
+    printf("%-24s %dx%d %6d->%-6d bytes %.3f bpp %.1f%c encode %.4fs decode %.4fs\n",
            file, w, h, wh, k, bpp, percent, '%', encode_time, decode_time);
     percentage_sum  += percent;
     encode_time_sum += encode_time;

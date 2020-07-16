@@ -29,6 +29,7 @@
 		B33EA68D24B2D18200727163 /* folders.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = folders.h; path = ../ext/folders.h; sourceTree = "<group>"; };
 		B33EA68E24B2D18200727163 /* stb_image_write.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = stb_image_write.h; path = ../ext/stb_image_write.h; sourceTree = "<group>"; };
 		B33EA68F24B2D18200727163 /* stb_image.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = stb_image.h; path = ../ext/stb_image.h; sourceTree = "<group>"; };
+		B367EA4424C1042B004B00DE /* bdgr.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = bdgr.h; path = ../bdgr.h; sourceTree = "<group>"; };
 		B395CE6E24B2D09900942C94 /* bdgr */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = bdgr; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -46,6 +47,7 @@
 		B395CE6524B2D09900942C94 = {
 			isa = PBXGroup;
 			children = (
+				B367EA4424C1042B004B00DE /* bdgr.h */,
 				B33EA68C24B2D18200727163 /* folders.c */,
 				B33EA68D24B2D18200727163 /* folders.h */,
 				B33EA68E24B2D18200727163 /* stb_image_write.h */,
