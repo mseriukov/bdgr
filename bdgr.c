@@ -16,6 +16,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <time.h>
+#include <io.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #ifdef _MSC_VER
@@ -46,6 +47,107 @@ extern "C" {
 #define assert(x) // osx Xcode clang build keeps asserts in release
 #endif
 
+#ifdef WIN32
+#define VC_EXTRALEAN
+#define WIN32_LEAN_AND_MEAN
+#include "windows.h"
+#include "memoryapi.h"
+
+double time_in_seconds() {
+    static int64_t freq = 0;
+    LARGE_INTEGER li;
+    QueryPerformanceCounter(&li);
+    if (freq == 0) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = f.QuadPart;
+    }
+    return (double)li.QuadPart / freq;
+}
+
+static void* mem_alloc(int bytes) { // 64 bit aligned, locked, zero initialized
+    void* a = VirtualAllocEx(GetCurrentProcess(), null, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    printf("a=%p %d\n", a, bytes);
+    return a;
+}
+
+static void mem_free(void* a, int bytes) {
+    if (a != null) {
+        VirtualFreeEx(GetCurrentProcess(), a, bytes, MEM_RELEASE|MEM_DECOMMIT);
+    }
+}
+
+void* mem_map(const char* filename, int* bytes, bool read_only) {
+    void* address = null;
+    *bytes = 0; // important for empty files - which result in (null, 0) and errno == 0
+    errno = 0;
+    DWORD access = read_only ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE);
+    DWORD share  = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    HANDLE file = CreateFileA(filename, access, share, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+    if (file == INVALID_HANDLE_VALUE) {
+        errno = GetLastError();
+    } else {
+        LARGE_INTEGER size = {{0, 0}};
+        if (GetFileSizeEx(file, &size) && 0 < size.QuadPart && size.QuadPart <= 0x7FFFFFFF) {
+            HANDLE map_file = CreateFileMappingA(file, NULL, read_only ? PAGE_READONLY : PAGE_READWRITE, 0, (DWORD)size.QuadPart, null);
+            if (map_file == null) {
+                errno = GetLastError();
+            } else {
+                address = MapViewOfFile(map_file, read_only ? FILE_MAP_READ : FILE_MAP_READ|SECTION_MAP_WRITE, 0, 0, (int)size.QuadPart);
+                if (address != null) {
+                    *bytes = (int)size.QuadPart;
+                } else {
+                    errno = GetLastError();
+                }
+                int b = CloseHandle(map_file); // not setting errno because CloseHandle is expected to work here
+                assert(b); (void)b;
+            }
+        } else {
+            errno = GetLastError();
+        }
+        int b = CloseHandle(file); // not setting errno because CloseHandle is expected to work here
+        assert(b); (void)b;
+    }
+    return address;
+}
+
+void mem_unmap(void* address, int bytes) {
+    if (address != null) {
+        int b = UnmapViewOfFile(address); (void)bytes; /* bytes unused, need by posix version */
+        assert(b); (void)b;
+    }
+}
+
+#else
+
+static double time_in_seconds() {
+    enum { BILLION = 1000000000 };
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t ns = ts.tv_sec * (uint64_t)BILLION + ts.tv_nsec;
+    static uint64_t ns0;
+    if (ns0 == 0) { ns0 = ns; }
+    return (ns - ns0) / (double)BILLION;
+}
+
+static void* mem_alloc(int bytes) { // 64 bit aligned, locked, zero initialized
+    bytes = (bytes + 7) / 8 * 8;
+    void* a = mmap(0, bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
+    if (a != null) { mlock(a, bytes); memset(a, 0, bytes); }
+    assert(((uintptr_t)a & 0x1F) == 0);
+    return a;
+}
+
+static void mem_free(void* a, int bytes) {
+    if (a != null) {
+        munlock(a, bytes);
+        munmap(a, bytes);
+    }
+}
+
+#endif
+
+
 enum { // must be the same in encode and decode
     cut_off = 11,
     start_with_bits = 7
@@ -70,9 +172,9 @@ enum { // must be the same in encode and decode
 #define push_bits(p, e, b64, count, val, bits) do {               \
     int v = val;                                                  \
     for (int i = 0; i < bits; i++) {                              \
-	if (v & 1) { push_bit_1(b64); } else { push_bit_0(b64); } \
-	push_out(p, e, b64, count);                               \
-	v >>= 1;                                                  \
+        if (v & 1) { push_bit_1(b64); } else { push_bit_0(b64); } \
+        push_out(p, e, b64, count);                               \
+        v >>= 1;                                                  \
     }                                                             \
 } done
 
@@ -124,7 +226,7 @@ int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
         prediction = px;
     }
     if (count > 0) { // flush last bits
-        b64 >>= 64 - count;
+        b64 >>= (64 - count);
         *p++ = b64;
     }
     (void)end; // for the performance reasons max_bytes is NOT checked in release build
@@ -146,23 +248,23 @@ int encode(const byte* data, int w, int h, byte* output, int max_bytes) {
     v = 0;                               \
     int mask = 1;                        \
     for (int i = 0; i < bits; i++) {     \
-    	pull_in(p, b64, count);          \
+        pull_in(p, b64, count);          \
         if ((int)b64 & 1) { v |= mask; } \
-	    mask <<= 1;                      \
+        mask <<= 1;                      \
         b64 >>= 1;                       \
         count--;                         \
     }                                    \
 } done
 
 int decode(const byte* input, int bytes, byte* output, int width, int height) {
-    assert(bytes % 8 == 0);
+    assert(bytes % 8 == 0); (void)bytes;
     uint64_t b64 = 0;
     int count = 0;
     uint64_t* p = (uint64_t*)input;
     int bits  = start_with_bits;
     int w; pull_bits(w, p, b64, count, 16);
     int h; pull_bits(h, p, b64, count, 16);
-    assert(w == width && h == height);
+    assert(w == width && h == height); (void)width; (void)height;
     byte* d = output;
     byte* end = output + w * h;
     byte prediction = 0;
@@ -196,31 +298,6 @@ int decode(const byte* input, int bytes, byte* output, int width, int height) {
     return w * h;
 }
 
-static double time_in_seconds() {
-    enum { BILLION = 1000000000 };
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t ns = ts.tv_sec * (uint64_t)BILLION + ts.tv_nsec;
-    static uint64_t ns0;
-    if (ns0 == 0) { ns0 = ns; }
-    return (ns - ns0) / (double)BILLION;
-}
-
-static void* mem_alloc(int bytes) { // 64 bit aligned, locked, zero initialized
-    bytes = (bytes + 7) / 8 * 8;
-    void* a = mmap(0, bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
-    if (a != null) { mlock(a, bytes); memset(a, 0, bytes); }
-    assert(((uintptr_t)a & 0x1F) == 0);
-    return a;
-}
-
-static void mem_free(void* a, int bytes) {
-    if (a != null) {
-	munlock(a, bytes);
-    	munmap(a, bytes);
-    }
-}
-
 // stats:
 
 static double percentage_sum;
@@ -229,6 +306,10 @@ static double decode_time_sum;
 static int    run_count;
 
 static void image_compress(const char* fn) {
+    if (access(fn, 0) != 0) {
+        fprintf(stderr, "file not found %s", fn);
+        exit(1);
+    }
     int w = 0;
     int h = 0;
     int c = 0;
@@ -266,7 +347,7 @@ static void image_compress(const char* fn) {
     const double bpp = k * 8 / (double)wh;
     const double percent = 100.0 * k / wh;
     printf("%s \t %dx%d %6d->%-6d bytes %.3f bpp %.1f%c encode %.4fs decode %.4fs\n",
-    	   file, w, h, wh, k, bpp, percent, '%', encode_time, decode_time);
+           file, w, h, wh, k, bpp, percent, '%', encode_time, decode_time);
     percentage_sum  += percent;
     encode_time_sum += encode_time;
     decode_time_sum += decode_time;
@@ -318,6 +399,9 @@ int main(int argc, const char* argv[]) {
     run(argc, argv);
     printf("avergage %.2f%c encode %.4fs decode %.4fs\n",
            percentage_sum / run_count, '%', encode_time_sum / run_count, decode_time_sum / run_count);
+    #ifdef WIN32
+        getchar();
+    #endif
 }
 
 #ifdef __cplusplus
