@@ -51,20 +51,20 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>false</LinkIncremental>
-    <OutDir>$(SolutionDir)..\bin\$(PlatformShortName)\vs2012\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)..\build\$(PlatformShortName)\vs2012\$(Configuration)\$(ProjectName)\</IntDir>
+    <OutDir>$(SolutionDir)..\bin\$(PlatformShortName)\2017\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)..\build\$(PlatformShortName)\2017\$(Configuration)\$(ProjectName)\</IntDir>
     <CodeAnalysisRuleSet>NativeMinimumRules.ruleset</CodeAnalysisRuleSet>
-    <TargetName>$(ProjectName)64_d</TargetName>
+    <TargetName>$(ProjectName)</TargetName>
     <CustomBuildAfterTargets>
     </CustomBuildAfterTargets>
     <PostBuildEventUseInBuild>false</PostBuildEventUseInBuild>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
-    <OutDir>$(SolutionDir)..\bin\$(PlatformShortName)\vs2012\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)..\build\$(PlatformShortName)\vs2012\$(Configuration)\$(ProjectName)\</IntDir>
+    <OutDir>$(SolutionDir)..\bin\$(PlatformShortName)\2017\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)..\build\$(PlatformShortName)\2017\$(Configuration)\$(ProjectName)\</IntDir>
     <CodeAnalysisRuleSet>NativeMinimumRules.ruleset</CodeAnalysisRuleSet>
-    <TargetName>$(ProjectName)64</TargetName>
+    <TargetName>$(ProjectName)</TargetName>
     <CustomBuildAfterTargets>
     </CustomBuildAfterTargets>
     <PostBuildEventUseInBuild>false</PostBuildEventUseInBuild>
@@ -128,7 +128,7 @@
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <Optimization>MaxSpeed</Optimization>
+      <Optimization>Full</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>WIN32;_WINDOWS;_CRT_SECURE_NO_WARNINGS=1;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -145,6 +145,9 @@
       <CompileAs>CompileAsCpp</CompileAs>
       <TreatSpecificWarningsAsErrors>4706</TreatSpecificWarningsAsErrors>
       <ExceptionHandling>false</ExceptionHandling>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <EnableParallelCodeGeneration>true</EnableParallelCodeGeneration>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
