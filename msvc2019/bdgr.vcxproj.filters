@@ -15,5 +15,6 @@
     <ClInclude Include="..\ext\folders.h">
       <Filter>ext</Filter>
     </ClInclude>
+    <ClInclude Include="..\bdgr.h" />
   </ItemGroup>
 </Project>

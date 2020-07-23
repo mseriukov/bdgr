@@ -15,6 +15,7 @@
     <ClCompile Include="..\bdgr.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\bdgr.h" />
     <ClInclude Include="..\ext\folders.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
@@ -85,6 +86,7 @@
       <ProgramDataBaseFileName>$(OutDir)$(TargetName).pdb</ProgramDataBaseFileName>
       <CompileAs>CompileAsCpp</CompileAs>
       <TreatSpecificWarningsAsErrors>4706</TreatSpecificWarningsAsErrors>
+      <ExceptionHandling>false</ExceptionHandling>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
@@ -139,7 +141,7 @@
       </PrecompiledHeaderFile>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
-      <EnableEnhancedInstructionSet>AdvancedVectorExtensions</EnableEnhancedInstructionSet>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <ProgramDataBaseFileName>$(OutDir)$(TargetName).pdb</ProgramDataBaseFileName>
       <CompileAs>CompileAsCpp</CompileAs>
       <TreatSpecificWarningsAsErrors>4706</TreatSpecificWarningsAsErrors>

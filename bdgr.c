@@ -30,6 +30,7 @@
 #else
     #include <unistd.h>
     #include <sys/mman.h>
+    #include <pthread.h>
 #endif
 
 #include "folders.h"
@@ -247,16 +248,29 @@ static int run(int argc, const char* argv[]) {
         memmove(&argv[1], &argv[2], (argc - 2) * sizeof(argv[1]));
         argc--;
     }
-    printf("average %.2f%c encode %.4fms decode %.3fms\n", percentage_sum / run_count, '%',
+    printf("average %.2f%c encode %.1fms decode %.1fms\n", percentage_sum / run_count, '%',
            (encode_time_sum / run_count) * 1000, (decode_time_sum / run_count) * 1000);
     return 0;
 }
 
 int main(int argc, const char* argv[]) {
-    run(argc, argv);
-    #if defined(WIN32) && defined(_DEBUG)
-        getchar();
+    #ifdef WIN32
+        SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        SetThreadAffinityMask(GetCurrentThread(), 1);
+    #else
+        int policy = 0;
+        struct sched_param param = {};
+        pthread_getschedparam(pthread_self(), &policy, &param);
+        param.sched_priority = sched_get_priority_max(policy);
+        pthread_setschedparam(pthread_self(), policy, &param);
+        pthread_setschedprio(pthread_self(), param.sched_priority);
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(0, &cpuset);
+        pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
     #endif
+    run(argc, argv);
     return 0;
 }
 
