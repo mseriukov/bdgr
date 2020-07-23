@@ -247,13 +247,13 @@ static int run(int argc, const char* argv[]) {
         memmove(&argv[1], &argv[2], (argc - 2) * sizeof(argv[1]));
         argc--;
     }
+    printf("average %.2f%c encode %.4fms decode %.3fms\n", percentage_sum / run_count, '%',
+           (encode_time_sum / run_count) * 1000, (decode_time_sum / run_count) * 1000);
     return 0;
 }
 
 int main(int argc, const char* argv[]) {
     run(argc, argv);
-    printf("average %.2f%c encode %.4fs decode %.4fs\n",
-           percentage_sum / run_count, '%', encode_time_sum / run_count, decode_time_sum / run_count);
     #if defined(WIN32) && defined(_DEBUG)
         getchar();
     #endif
