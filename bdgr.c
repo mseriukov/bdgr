@@ -264,11 +264,13 @@ int main(int argc, const char* argv[]) {
         pthread_getschedparam(pthread_self(), &policy, &param);
         param.sched_priority = sched_get_priority_max(policy);
         pthread_setschedparam(pthread_self(), policy, &param);
-        pthread_setschedprio(pthread_self(), param.sched_priority);
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(0, &cpuset);
-        pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+        #ifdef __linux__
+            pthread_setschedprio(pthread_self(), param.sched_priority);
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(0, &cpuset);
+            pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+        #endif
     #endif
     run(argc, argv);
     return 0;

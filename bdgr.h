@@ -180,19 +180,19 @@ int bdgr_encode(const void* data, int w, int h, void* output, int max_bytes) {
         byte px = *s++;
         int delta = px - prediction;
         swear((byte)(prediction + delta) == px);
-#ifdef BDGR_NO_TABLES
-        delta = delta < 0 ? delta + 256 : delta;
-        delta = delta >= 128 ? delta - 256 : delta;
-        // this folds abs(deltas) > 128 to much smaller numbers which is OK
-        swear(-128 <= delta && delta <= 127);
-        // delta:    -128 ... -2, -1, 0, +1, +2 ... + 127
-        // positive:                  0,  2,  4       254
-        // negative:  255      3   1
-        int rice = delta >= 0 ? delta * 2 : -delta * 2 - 1;
-        swear(0 <= rice && rice <= 0xFF);
-#else
-        byte rice = bdgr_d2r[delta + 255];
-#endif
+        #ifdef BDGR_NO_TABLES
+            delta = delta < 0 ? delta + 256 : delta;
+            delta = delta >= 128 ? delta - 256 : delta;
+            // this folds abs(deltas) > 128 to much smaller numbers which is OK
+            swear(-128 <= delta && delta <= 127);
+            // delta:    -128 ... -2, -1, 0, +1, +2 ... + 127
+            // positive:                  0,  2,  4       254
+            // negative:  255      3   1
+            int rice = delta >= 0 ? delta * 2 : -delta * 2 - 1;
+            swear(0 <= rice && rice <= 0xFF);
+        #else
+            byte rice = bdgr_d2r[delta + 255];
+        #endif
         const int m = 1 << bits;
         int q = rice >> bits; // rice / m quotient
         if (q < bdgr_cut_off) {
@@ -286,11 +286,11 @@ int bdgr_decode(const void* input, int bytes, void* output, int width, int heigh
             pull_bits(rice, p, b64, count, 8);
         }
         swear(0 <= rice && rice <= 0xFF);
-#ifdef BDGR_NO_TABLES
-        int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
-#else
-        byte delta = bdgr_r2d[rice];
-#endif
+        #ifdef BDGR_NO_TABLES
+            int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
+        #else
+            byte delta = bdgr_r2d[rice];
+        #endif
         byte v = (byte)(prediction + delta);
         *d++ = v;
         prediction = v;
