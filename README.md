@@ -1,2 +1,4 @@
-# loco
-Experiments with T.87 Lossless and Near Lossless Compression
+# bdgr
+Brain Dead Golomb Rice inspired by LOCO compression and JPEG-LS
+
+Simplest possible predictor and fastest possible encoding/decoding

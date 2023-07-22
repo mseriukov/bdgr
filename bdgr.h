@@ -1,0 +1,326 @@
+/* Copyright 2020 "Leo" Dmitry Kuznetsov https://leok7v.github.io/
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+       http://www.apache.org/licenses/LICENSE-2.0
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License. */
+
+#ifdef _MSC_VER // using compiler identification instead of WIN32
+#include <intrin.h> // SSE & AVX
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// This is single header library - define BDGR_IMPLEMENTATION before including
+// Prerequisits: #include <stdint.h>
+
+// Suggested output size at least 3-4 times of w * h
+// Important assumptions:
+// max_bytes must be multiples of 8!
+// w - width and h - height in pixels is encoded into output header and must be <= 0xFFFF
+// only correct for little endian processors
+
+int  bdgr_encode(const void* input, int w, int h, void* output, int max_bytes);
+void bdgr_header(const void* input, int *w, int *h);
+int  bdgr_decode(const void* input, int bytes, void* output, int w, int h);
+
+#ifdef BDGR_IMPLEMENTATION
+
+#pragma push_macro("implore")
+#pragma push_macro("swear")
+#pragma push_macro("ctz")
+#pragma push_macro("byte")
+#pragma push_macro("done")
+#pragma push_macro("push_out")
+#pragma push_macro("push_bit_0")
+#pragma push_macro("push_bit_1")
+#pragma push_macro("push_bits")
+#pragma push_macro("pull_in")
+#pragma push_macro("pull_bits")
+
+#define byte uint8_t
+
+// "supreme moral vigilance:" implore / swear https://github.com/munificent/vigil
+
+#if defined(DEBUG) || defined(_DEBUG)
+    #define implore(b) assert(b)
+    #define swear(b) assert(b)
+#else // to prevent osx Xcode clang build from keeping asserts in release
+    #define implore(b)
+    #define swear(b)
+#endif
+
+enum { // must be the same in encode and decode
+    bdgr_cut_off = 11,
+    bdgr_start_with_bits = 7
+};
+
+// bdgr_k4rice is result of bits_estimate() for rice in [0..255]
+//   bits = 0;
+//   while ((1 << bits) < rice) { bits++; }
+//   if (bits > 1) { bits--; } // imperical: compresses a bit more
+
+static const int bdgr_k4rice[256] = {
+    0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7
+};
+
+static const byte bdgr_d2r[511] = {
+    0x02, 0x04, 0x06, 0x08, 0x0A, 0x0C, 0x0E, 0x10, 0x12, 0x14, 0x16, 0x18, 0x1A, 0x1C, 0x1E, 0x20,
+    0x22, 0x24, 0x26, 0x28, 0x2A, 0x2C, 0x2E, 0x30, 0x32, 0x34, 0x36, 0x38, 0x3A, 0x3C, 0x3E, 0x40,
+    0x42, 0x44, 0x46, 0x48, 0x4A, 0x4C, 0x4E, 0x50, 0x52, 0x54, 0x56, 0x58, 0x5A, 0x5C, 0x5E, 0x60,
+    0x62, 0x64, 0x66, 0x68, 0x6A, 0x6C, 0x6E, 0x70, 0x72, 0x74, 0x76, 0x78, 0x7A, 0x7C, 0x7E, 0x80,
+    0x82, 0x84, 0x86, 0x88, 0x8A, 0x8C, 0x8E, 0x90, 0x92, 0x94, 0x96, 0x98, 0x9A, 0x9C, 0x9E, 0xA0,
+    0xA2, 0xA4, 0xA6, 0xA8, 0xAA, 0xAC, 0xAE, 0xB0, 0xB2, 0xB4, 0xB6, 0xB8, 0xBA, 0xBC, 0xBE, 0xC0,
+    0xC2, 0xC4, 0xC6, 0xC8, 0xCA, 0xCC, 0xCE, 0xD0, 0xD2, 0xD4, 0xD6, 0xD8, 0xDA, 0xDC, 0xDE, 0xE0,
+    0xE2, 0xE4, 0xE6, 0xE8, 0xEA, 0xEC, 0xEE, 0xF0, 0xF2, 0xF4, 0xF6, 0xF8, 0xFA, 0xFC, 0xFE, 0xFF,
+    0xFD, 0xFB, 0xF9, 0xF7, 0xF5, 0xF3, 0xF1, 0xEF, 0xED, 0xEB, 0xE9, 0xE7, 0xE5, 0xE3, 0xE1, 0xDF,
+    0xDD, 0xDB, 0xD9, 0xD7, 0xD5, 0xD3, 0xD1, 0xCF, 0xCD, 0xCB, 0xC9, 0xC7, 0xC5, 0xC3, 0xC1, 0xBF,
+    0xBD, 0xBB, 0xB9, 0xB7, 0xB5, 0xB3, 0xB1, 0xAF, 0xAD, 0xAB, 0xA9, 0xA7, 0xA5, 0xA3, 0xA1, 0x9F,
+    0x9D, 0x9B, 0x99, 0x97, 0x95, 0x93, 0x91, 0x8F, 0x8D, 0x8B, 0x89, 0x87, 0x85, 0x83, 0x81, 0x7F,
+    0x7D, 0x7B, 0x79, 0x77, 0x75, 0x73, 0x71, 0x6F, 0x6D, 0x6B, 0x69, 0x67, 0x65, 0x63, 0x61, 0x5F,
+    0x5D, 0x5B, 0x59, 0x57, 0x55, 0x53, 0x51, 0x4F, 0x4D, 0x4B, 0x49, 0x47, 0x45, 0x43, 0x41, 0x3F,
+    0x3D, 0x3B, 0x39, 0x37, 0x35, 0x33, 0x31, 0x2F, 0x2D, 0x2B, 0x29, 0x27, 0x25, 0x23, 0x21, 0x1F,
+    0x1D, 0x1B, 0x19, 0x17, 0x15, 0x13, 0x11, 0x0F, 0x0D, 0x0B, 0x09, 0x07, 0x05, 0x03, 0x01, 0x00,
+    0x02, 0x04, 0x06, 0x08, 0x0A, 0x0C, 0x0E, 0x10, 0x12, 0x14, 0x16, 0x18, 0x1A, 0x1C, 0x1E, 0x20,
+    0x22, 0x24, 0x26, 0x28, 0x2A, 0x2C, 0x2E, 0x30, 0x32, 0x34, 0x36, 0x38, 0x3A, 0x3C, 0x3E, 0x40,
+    0x42, 0x44, 0x46, 0x48, 0x4A, 0x4C, 0x4E, 0x50, 0x52, 0x54, 0x56, 0x58, 0x5A, 0x5C, 0x5E, 0x60,
+    0x62, 0x64, 0x66, 0x68, 0x6A, 0x6C, 0x6E, 0x70, 0x72, 0x74, 0x76, 0x78, 0x7A, 0x7C, 0x7E, 0x80,
+    0x82, 0x84, 0x86, 0x88, 0x8A, 0x8C, 0x8E, 0x90, 0x92, 0x94, 0x96, 0x98, 0x9A, 0x9C, 0x9E, 0xA0,
+    0xA2, 0xA4, 0xA6, 0xA8, 0xAA, 0xAC, 0xAE, 0xB0, 0xB2, 0xB4, 0xB6, 0xB8, 0xBA, 0xBC, 0xBE, 0xC0,
+    0xC2, 0xC4, 0xC6, 0xC8, 0xCA, 0xCC, 0xCE, 0xD0, 0xD2, 0xD4, 0xD6, 0xD8, 0xDA, 0xDC, 0xDE, 0xE0,
+    0xE2, 0xE4, 0xE6, 0xE8, 0xEA, 0xEC, 0xEE, 0xF0, 0xF2, 0xF4, 0xF6, 0xF8, 0xFA, 0xFC, 0xFE, 0xFF,
+    0xFD, 0xFB, 0xF9, 0xF7, 0xF5, 0xF3, 0xF1, 0xEF, 0xED, 0xEB, 0xE9, 0xE7, 0xE5, 0xE3, 0xE1, 0xDF,
+    0xDD, 0xDB, 0xD9, 0xD7, 0xD5, 0xD3, 0xD1, 0xCF, 0xCD, 0xCB, 0xC9, 0xC7, 0xC5, 0xC3, 0xC1, 0xBF,
+    0xBD, 0xBB, 0xB9, 0xB7, 0xB5, 0xB3, 0xB1, 0xAF, 0xAD, 0xAB, 0xA9, 0xA7, 0xA5, 0xA3, 0xA1, 0x9F,
+    0x9D, 0x9B, 0x99, 0x97, 0x95, 0x93, 0x91, 0x8F, 0x8D, 0x8B, 0x89, 0x87, 0x85, 0x83, 0x81, 0x7F,
+    0x7D, 0x7B, 0x79, 0x77, 0x75, 0x73, 0x71, 0x6F, 0x6D, 0x6B, 0x69, 0x67, 0x65, 0x63, 0x61, 0x5F,
+    0x5D, 0x5B, 0x59, 0x57, 0x55, 0x53, 0x51, 0x4F, 0x4D, 0x4B, 0x49, 0x47, 0x45, 0x43, 0x41, 0x3F,
+    0x3D, 0x3B, 0x39, 0x37, 0x35, 0x33, 0x31, 0x2F, 0x2D, 0x2B, 0x29, 0x27, 0x25, 0x23, 0x21, 0x1F,
+    0x1D, 0x1B, 0x19, 0x17, 0x15, 0x13, 0x11, 0x0F, 0x0D, 0x0B, 0x09, 0x07, 0x05, 0x03, 0x01
+};
+
+static const byte bdgr_r2d[256] = {
+    0x00, 0xFF, 0x01, 0xFE, 0x02, 0xFD, 0x03, 0xFC, 0x04, 0xFB, 0x05, 0xFA, 0x06, 0xF9, 0x07, 0xF8,
+    0x08, 0xF7, 0x09, 0xF6, 0x0A, 0xF5, 0x0B, 0xF4, 0x0C, 0xF3, 0x0D, 0xF2, 0x0E, 0xF1, 0x0F, 0xF0,
+    0x10, 0xEF, 0x11, 0xEE, 0x12, 0xED, 0x13, 0xEC, 0x14, 0xEB, 0x15, 0xEA, 0x16, 0xE9, 0x17, 0xE8,
+    0x18, 0xE7, 0x19, 0xE6, 0x1A, 0xE5, 0x1B, 0xE4, 0x1C, 0xE3, 0x1D, 0xE2, 0x1E, 0xE1, 0x1F, 0xE0,
+    0x20, 0xDF, 0x21, 0xDE, 0x22, 0xDD, 0x23, 0xDC, 0x24, 0xDB, 0x25, 0xDA, 0x26, 0xD9, 0x27, 0xD8,
+    0x28, 0xD7, 0x29, 0xD6, 0x2A, 0xD5, 0x2B, 0xD4, 0x2C, 0xD3, 0x2D, 0xD2, 0x2E, 0xD1, 0x2F, 0xD0,
+    0x30, 0xCF, 0x31, 0xCE, 0x32, 0xCD, 0x33, 0xCC, 0x34, 0xCB, 0x35, 0xCA, 0x36, 0xC9, 0x37, 0xC8,
+    0x38, 0xC7, 0x39, 0xC6, 0x3A, 0xC5, 0x3B, 0xC4, 0x3C, 0xC3, 0x3D, 0xC2, 0x3E, 0xC1, 0x3F, 0xC0,
+    0x40, 0xBF, 0x41, 0xBE, 0x42, 0xBD, 0x43, 0xBC, 0x44, 0xBB, 0x45, 0xBA, 0x46, 0xB9, 0x47, 0xB8,
+    0x48, 0xB7, 0x49, 0xB6, 0x4A, 0xB5, 0x4B, 0xB4, 0x4C, 0xB3, 0x4D, 0xB2, 0x4E, 0xB1, 0x4F, 0xB0,
+    0x50, 0xAF, 0x51, 0xAE, 0x52, 0xAD, 0x53, 0xAC, 0x54, 0xAB, 0x55, 0xAA, 0x56, 0xA9, 0x57, 0xA8,
+    0x58, 0xA7, 0x59, 0xA6, 0x5A, 0xA5, 0x5B, 0xA4, 0x5C, 0xA3, 0x5D, 0xA2, 0x5E, 0xA1, 0x5F, 0xA0,
+    0x60, 0x9F, 0x61, 0x9E, 0x62, 0x9D, 0x63, 0x9C, 0x64, 0x9B, 0x65, 0x9A, 0x66, 0x99, 0x67, 0x98,
+    0x68, 0x97, 0x69, 0x96, 0x6A, 0x95, 0x6B, 0x94, 0x6C, 0x93, 0x6D, 0x92, 0x6E, 0x91, 0x6F, 0x90,
+    0x70, 0x8F, 0x71, 0x8E, 0x72, 0x8D, 0x73, 0x8C, 0x74, 0x8B, 0x75, 0x8A, 0x76, 0x89, 0x77, 0x88,
+    0x78, 0x87, 0x79, 0x86, 0x7A, 0x85, 0x7B, 0x84, 0x7C, 0x83, 0x7D, 0x82, 0x7E, 0x81, 0x7F, 0x80
+};
+
+#define done while (false)
+
+#define push_out(p, e, b64, count) do {                        \
+    count++;                                                   \
+    if (count == 64) { *p++ = b64; count = 0; swear(p <= e); } \
+} done
+
+#define push_bit_0(b64) b64 >>= 1
+
+#define push_bit_1(b64) b64 = (1ULL << 63) | (b64 >> 1)
+
+#define push_bits(p, e, b64, count, val, bits) do {               \
+    int v = val;                                                  \
+    for (int i = 0; i < bits; i++) {                              \
+        if (v & 1) { push_bit_1(b64); } else { push_bit_0(b64); } \
+        push_out(p, e, b64, count);                               \
+        v >>= 1;                                                  \
+    }                                                             \
+} done
+
+#ifndef _MSC_VER // using compiler identification instead of WIN32
+    #define ctz(x) __builtin_ctz(x) // __builtin_ctz(0) is undefined!
+    #define prefetch(p) __builtin_prefetch(p, 0, 3) // https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html
+#else // Microsoft Windows version __builtin_ctz
+    static uint32_t __forceinline ctz(uint32_t x) {
+        unsigned long r = 0; implore(x != 0); _BitScanForward(&r, (unsigned long)x); return r;
+    }
+    // imperically: _MM_HINT_T2 is about 3% faster then _MM_HINT_NTA, _MM_HINT_T0 and _MM_HINT_T1
+    #define prefetch(p) _mm_prefetch((const char*)p, _MM_HINT_T2) // retain in all caches
+#endif
+
+int bdgr_encode(const void* data, int w, int h, void* output, int max_bytes) {
+    implore(max_bytes % 8 == 0);
+    const uint64_t* end = (uint64_t*)((byte*)output + max_bytes);
+    uint64_t b64 = 0;
+    int count = 0;
+    uint64_t* p = (uint64_t*)output;
+    // shared knowledge between encoder and decoder:
+    // does not have to be encoded in the stream, may as well be simply known by both
+    push_bits(p, end, b64, count, w, 16);
+    push_bits(p, end, b64, count, h, 16);
+    int bits = bdgr_start_with_bits;
+    byte prediction = 0;
+    const byte* s = (byte*)data;
+    const byte* e = s + w * h;
+    while (s < e) {
+        byte px = *s++;
+        int delta = px - prediction;
+        swear((byte)(prediction + delta) == px);
+        #ifdef BDGR_NO_TABLES
+            delta = delta < 0 ? delta + 256 : delta;
+            delta = delta >= 128 ? delta - 256 : delta;
+            // this folds abs(deltas) > 128 to much smaller numbers which is OK
+            swear(-128 <= delta && delta <= 127);
+            // delta:    -128 ... -2, -1, 0, +1, +2 ... + 127
+            // positive:                  0,  2,  4       254
+            // negative:  255      3   1
+            int rice = delta >= 0 ? delta * 2 : -delta * 2 - 1;
+            swear(0 <= rice && rice <= 0xFF);
+        #else
+            byte rice = bdgr_d2r[delta + 255];
+        #endif
+        const int m = 1 << bits;
+        int q = rice >> bits; // rice / m quotient
+        if (q < bdgr_cut_off) {
+            while (q > 0) { push_bit_0(b64); push_out(p, end, b64, count); q--; }
+            push_bit_1(b64); push_out(p, end, b64, count);
+            const int r = rice & (m - 1); // v % m reminder (bits)
+            push_bits(p, end, b64, count, r, bits);
+        } else {
+            q = bdgr_cut_off;
+            while (q > 0) { push_bit_0(b64); push_out(p, end, b64, count); q--; }
+            push_bit_1(b64); push_out(p, end, b64, count);
+            push_bits(p, end, b64, count, rice, 8);
+        }
+        bits = bdgr_k4rice[rice];
+        prediction = px;
+    }
+    if (count > 0) { // flush last bits
+        b64 >>= (64 - count);
+        *p++ = b64;
+    }
+    (void)end; // for the performance reasons max_bytes is NOT checked in release build
+    return (int)((byte*)p - (byte*)output); // in 64 bits increments
+}
+
+#define pull_in(p, b64, count) do {             \
+    if (count == 0) {                           \
+        b64 = *p++;                             \
+        count = 64;                             \
+        prefetch(p);                            \
+    }                                           \
+} done
+
+#define pull_bits(v, p, b64, count, bits) do {  \
+    if (count >= bits) {                        \
+        v = (uint32_t)b64 & ((1U << bits) - 1); \
+        b64 >>= bits;                           \
+        count -= bits;                          \
+    } else {                                    \
+        v = 0;                                  \
+        int mask = 1;                           \
+        for (int i = 0; i < bits; i++) {        \
+            implore(count > 0);                 \
+            if ((int)b64 & 1) { v |= mask; }    \
+            mask <<= 1;                         \
+            b64 >>= 1;                          \
+            count--;                            \
+            pull_in(p, b64, count);             \
+        }                                       \
+    }                                           \
+} done
+
+int bdgr_decode(const void* input, int bytes, void* output, int width, int height) {
+    implore(bytes % 8 == 0); (void)bytes;
+    uint64_t* p = (uint64_t*)input;
+    uint64_t b64 = 0;
+    int count = 0; // number of valid bits in b64
+    int bits  = bdgr_start_with_bits;
+    pull_in(p, b64, count); // pull in first 64 bits
+    int w; pull_bits(w, p, b64, count, 16);
+    int h; pull_bits(h, p, b64, count, 16);
+    implore(w == width && h == height); (void)width; (void)height;
+    byte* d = (byte*)output;
+    byte* end = d + w * h;
+    byte prediction = 0;
+    while (d < end) {
+        int q = 0;
+        pull_in(p, b64, count);
+        if (count > bdgr_cut_off) {
+            implore((uint32_t)b64 != 0);
+            q = ctz((uint32_t)b64);
+            b64  >>= (q + 1);
+            count -= (q + 1);
+            pull_in(p, b64, count); // pull in next bits if necessary
+        } else { // not enough bits in b64, do it one by one
+            for (;;) {
+                implore(count > 0);
+                int bit = (int)b64 & 1;
+                b64 >>= 1;
+                count--;
+                pull_in(p, b64, count);
+                if (bit == 1) { break; }
+                q++;
+            }
+        }
+        int rice;
+        if (q < bdgr_cut_off) {
+            int r;
+            pull_bits(r, p, b64, count, bits);
+            rice = (q << bits) | r;
+        } else {
+            pull_bits(rice, p, b64, count, 8);
+        }
+        swear(0 <= rice && rice <= 0xFF);
+        #ifdef BDGR_NO_TABLES
+            int delta = rice % 2 == 0 ? rice / 2 : -(rice / 2) - 1;
+        #else
+            byte delta = bdgr_r2d[rice];
+        #endif
+        byte v = (byte)(prediction + delta);
+        *d++ = v;
+        prediction = v;
+        bits = bdgr_k4rice[rice];
+    }
+    return w * h;
+}
+
+void bdgr_header(const void* input, int *w, int *h) {
+    uint64_t* p = (uint64_t*)input;
+    uint64_t b64 = 0;
+    int count = 0; // number of valid bits in b64
+    pull_bits(*w, p, b64, count, 16);
+    pull_bits(*h, p, b64, count, 16);
+}
+
+#pragma pop_macro("implore")
+#pragma pop_macro("swear")
+#pragma pop_macro("ctz")
+#pragma pop_macro("byte")
+#pragma pop_macro("done")
+#pragma pop_macro("push_out")
+#pragma pop_macro("push_bit_0")
+#pragma pop_macro("push_bit_1")
+#pragma pop_macro("push_bits")
+#pragma pop_macro("pull_in")
+#pragma pop_macro("pull_bits")
+
+#endif // BDGR_IMPLEMENTATION
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
